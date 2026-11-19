@@ -9,12 +9,15 @@ import {
   orderBy,
   query,
   serverTimestamp,
+  setDoc,
   updateDoc,
 } from 'firebase/firestore';
 import {
   BookOpen,
   Check,
   ChefHat,
+  KeyRound,
+  Lock,
   LogOut,
   Minus,
   Package,
@@ -23,9 +26,11 @@ import {
   Send,
   Share2,
   ShoppingBasket,
+  Snowflake,
   Trash2,
   UserPlus,
   Users,
+  Volume2,
   X,
 } from 'lucide-react';
 import { db } from './firebase';
@@ -33,8 +38,9 @@ import { db } from './firebase';
 /* ─── Tipi ─────────────────────────────────────────────── */
 type Role = 'operatore' | 'responsabile';
 type Category = 'carne' | 'pesce' | 'verdure' | 'latticini' | 'pasticceria' | 'altro';
+type StorageZone = 'cella_congelamento' | 'magazzino';
 
-type User = { id: string; name: string; role: Role };
+type User = { id: string; name: string; role: Role; pin: string };
 type Product = {
   id: string;
   name: string;
@@ -49,6 +55,7 @@ type Item = {
   unit: string;
   min: number;
   category: Category;
+  zone: StorageZone;
   productId?: string;
 };
 type Draft = {
@@ -58,9 +65,17 @@ type Draft = {
   unit: string;
   min: number;
   category: Category;
+  zone: StorageZone;
   productId?: string;
 };
-type OrderLine = { itemId: string; name: string; quantity: number; unit: string; category: Category };
+type OrderUnit = 'kg' | 'cartoni';
+type OrderLine = {
+  productKey: string;
+  name: string;
+  quantity: number;
+  unit: OrderUnit;
+  category: Category;
+};
 type Order = {
   id: string;
   operatorId: string;
@@ -71,7 +86,9 @@ type Order = {
   createdAt?: { seconds: number };
 };
 
-const UNITS = ['pz', 'kg', 'l', 'conf.'];
+const STOCK_UNITS = ['kg', 'cartoni', 'pz', 'l', 'conf.'];
+const ORDER_UNITS: OrderUnit[] = ['kg', 'cartoni'];
+
 const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
   { id: 'carne', label: 'Carne', emoji: '🥩' },
   { id: 'pesce', label: 'Pesce', emoji: '🐟' },
@@ -89,35 +106,30 @@ const productsCol = collection(db, 'products');
 const isLow = (i: Item) => i.quantity <= i.min;
 const STORAGE_KEY = 'kitchenos-user-id';
 
-/* ─── Suono notifica ───────────────────────────────────── */
+/* ─── Suono notifica (doppio squillo ad alto volume) ──── */
 function playNotifySound() {
   try {
-    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.connect(g);
-    g.connect(ctx.destination);
-    o.frequency.value = 880;
-    o.type = 'sine';
-    g.gain.setValueAtTime(0.25, ctx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
-    o.start(ctx.currentTime);
-    o.stop(ctx.currentTime + 0.4);
-    // secondo beep
-    setTimeout(() => {
-      const o2 = ctx.createOscillator();
-      const g2 = ctx.createGain();
-      o2.connect(g2);
-      g2.connect(ctx.destination);
-      o2.frequency.value = 1174;
-      o2.type = 'sine';
-      g2.gain.setValueAtTime(0.25, ctx.currentTime);
-      g2.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
-      o2.start(ctx.currentTime);
-      o2.stop(ctx.currentTime + 0.35);
-    }, 180);
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    const ctx = new AudioCtx();
+    const notes = [880, 1174.66, 1318.51];
+    notes.forEach((freq, idx) => {
+      const start = ctx.currentTime + idx * 0.16;
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.frequency.value = freq;
+      o.type = 'triangle';
+      g.gain.setValueAtTime(0.4, start);
+      g.gain.exponentialRampToValueAtTime(0.01, start + 0.35);
+      o.start(start);
+      o.stop(start + 0.35);
+    });
+    if ('vibrate' in navigator) {
+      navigator.vibrate([250, 100, 250, 100, 400]);
+    }
   } catch {
-    /* silenzioso se non supportato */
+    /* silenzioso se bloccato prima dell'interazione */
   }
 }
 
@@ -133,15 +145,29 @@ async function sendEmailAlert(i: Item, quantity: number) {
   }
 }
 
-function showBrowserNotification(title: string, body: string) {
+async function showPushNotification(title: string, body: string) {
   if (!('Notification' in window)) return;
-  if (Notification.permission === 'granted') {
-    new Notification(title, { body, icon: '/favicon.ico', tag: 'kitchenos-order' });
-  } else if (Notification.permission !== 'denied') {
-    Notification.requestPermission().then((p) => {
-      if (p === 'granted') new Notification(title, { body, icon: '/favicon.ico', tag: 'kitchenos-order' });
-    });
+  if (Notification.permission === 'default') {
+    await Notification.requestPermission();
   }
+  if (Notification.permission !== 'granted') return;
+
+  const options: NotificationOptions = {
+    body,
+    icon: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
+    badge: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
+    tag: 'kitchenos-order-' + Date.now(),
+    requireInteraction: true,
+  };
+
+  if ('serviceWorker' in navigator) {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg) {
+      await reg.showNotification(title, options);
+      return;
+    }
+  }
+  new Notification(title, options);
 }
 
 /* ─── App principale ───────────────────────────────────── */
@@ -150,11 +176,18 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [booting, setBooting] = useState(true);
   const [tab, setTab] = useState<'giacenza' | 'ordini' | 'catalogo' | 'account'>('giacenza');
+  const [pendingOrdersCount, setPendingOrdersCount] = useState(0);
+  const knownOrderIds = useRef<Set<string>>(new Set());
+  const initialOrdersLoaded = useRef(false);
 
-  // carica utenti e ripristina sessione
+  // Carica utenti e ripristina sessione
   useEffect(() => {
     const unsub = onSnapshot(query(usersCol, orderBy('name')), (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<User, 'id'>) }));
+      const list = snap.docs.map((d) => ({
+        pin: '0000',
+        ...(d.data() as Omit<User, 'id'>),
+        id: d.id,
+      }));
       setUsers(list);
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
@@ -167,11 +200,66 @@ export default function App() {
     return unsub;
   }, []);
 
-  function login(u: User) {
+  // Listener globale sugli ordini per il responsabile (attivo su qualsiasi tab)
+  useEffect(() => {
+    if (!currentUser || currentUser.role !== 'responsabile') {
+      setPendingOrdersCount(0);
+      initialOrdersLoaded.current = false;
+      knownOrderIds.current.clear();
+      return;
+    }
+
+    const unsub = onSnapshot(query(ordersCol, orderBy('createdAt', 'desc')), (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Order, 'id'>) }));
+      const pending = list.filter((o) => o.status === 'pending');
+      setPendingOrdersCount(pending.length);
+
+      if (!initialOrdersLoaded.current) {
+        list.forEach((o) => knownOrderIds.current.add(o.id));
+        initialOrdersLoaded.current = true;
+        return;
+      }
+
+      list.forEach((o) => {
+        if (!knownOrderIds.current.has(o.id)) {
+          knownOrderIds.current.add(o.id);
+          if (o.status === 'pending') {
+            playNotifySound();
+            const summary = o.lines
+              .map((l) => `${l.name} (${l.quantity} ${l.unit})`)
+              .join(', ');
+            showPushNotification(`Nuovo ordine da ${o.operatorName}`, summary);
+          }
+        }
+      });
+    });
+
+    return unsub;
+  }, [currentUser]);
+
+  async function login(u: User) {
     localStorage.setItem(STORAGE_KEY, u.id);
     setCurrentUser(u);
     if ('Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission();
+      await Notification.requestPermission();
+    }
+    if (u.role === 'responsabile') {
+      try {
+        const { registerPushToken } = await import('./firebase');
+        if (typeof registerPushToken === 'function') {
+          const token = await registerPushToken();
+          if (token) {
+            await setDoc(doc(db, 'pushTokens', u.id), {
+              token,
+              userId: u.id,
+              userName: u.name,
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+      } catch {
+        /* FCM opzionale se non ancora configurato con VAPID key */
+      }
     }
   }
 
@@ -182,16 +270,14 @@ export default function App() {
   }
 
   if (booting) {
-    return (
-      <div className="grid min-h-dvh place-items-center text-ink/50">
-        Caricamento…
-      </div>
-    );
+    return <div className="grid min-h-dvh place-items-center text-ink/50">Caricamento…</div>;
   }
 
   if (!currentUser) {
     return <LoginScreen users={users} onLogin={login} />;
   }
+
+  const isResp = currentUser.role === 'responsabile';
 
   return (
     <div className="mx-auto min-h-dvh max-w-xl pb-24 pt-4">
@@ -199,23 +285,35 @@ export default function App() {
         <div>
           <h1 className="font-display text-3xl font-extrabold tracking-tight">KitchenOS</h1>
           <p className="text-sm text-ink/60">
-            {currentUser.name} · {currentUser.role === 'responsabile' ? 'Responsabile' : 'Operatore'}
+            {currentUser.name} · {isResp ? 'Responsabile' : 'Operatore'}
           </p>
         </div>
-        <button
-          onClick={logout}
-          className="flex h-11 items-center gap-2 rounded-full bg-white px-4 text-sm font-semibold ring-1 ring-ink/10"
-        >
-          <LogOut className="size-4" /> Esci
-        </button>
+        <div className="flex items-center gap-2">
+          {isResp && (
+            <button
+              onClick={() => {
+                playNotifySound();
+                showPushNotification('Test Notifica KitchenOS', 'Audio e notifiche attivi.');
+              }}
+              title="Testa suono notifica"
+              className="grid size-11 place-items-center rounded-full bg-white text-basil ring-1 ring-ink/10"
+            >
+              <Volume2 className="size-5" />
+            </button>
+          )}
+          <button
+            onClick={logout}
+            className="flex h-11 items-center gap-2 rounded-full bg-white px-4 text-sm font-semibold ring-1 ring-ink/10"
+          >
+            <LogOut className="size-4" /> Esci
+          </button>
+        </div>
       </header>
 
       {tab === 'giacenza' && <InventorySection currentUser={currentUser} />}
       {tab === 'ordini' && <OrdersSection currentUser={currentUser} />}
-      {tab === 'catalogo' && <CatalogSection />}
-      {tab === 'account' && currentUser.role === 'responsabile' && (
-        <AccountsSection users={users} />
-      )}
+      {tab === 'catalogo' && <CatalogSection currentUser={currentUser} />}
+      {tab === 'account' && isResp && <AccountsSection users={users} />}
 
       {/* Bottom nav */}
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-ink/10 bg-white/95 backdrop-blur">
@@ -231,14 +329,15 @@ export default function App() {
             onClick={() => setTab('ordini')}
             icon={<ShoppingBasket className="size-5" />}
             label="Ordini"
+            badge={isResp ? pendingOrdersCount : 0}
           />
           <NavBtn
             active={tab === 'catalogo'}
             onClick={() => setTab('catalogo')}
             icon={<BookOpen className="size-5" />}
-            label="Catalogo"
+            label="Merce Base"
           />
-          {currentUser.role === 'responsabile' && (
+          {isResp && (
             <NavBtn
               active={tab === 'account'}
               onClick={() => setTab('account')}
@@ -257,62 +356,161 @@ function NavBtn({
   onClick,
   icon,
   label,
+  badge = 0,
 }: {
   active: boolean;
   onClick: () => void;
   icon: ReactNode;
   label: string;
+  badge?: number;
 }) {
   return (
     <button
       onClick={onClick}
-      className={`flex flex-col items-center gap-0.5 px-4 py-1 text-xs font-semibold ${
+      className={`relative flex flex-col items-center gap-0.5 px-4 py-1 text-xs font-semibold ${
         active ? 'text-basil' : 'text-ink/50'
       }`}
     >
       {icon}
+      {badge > 0 && (
+        <span className="absolute right-2 top-0 grid min-w-5 place-items-center rounded-full bg-tomato px-1 text-[10px] font-bold text-white">
+          {badge}
+        </span>
+      )}
       {label}
     </button>
   );
 }
 
-/* ─── Login ────────────────────────────────────────────── */
+/* ─── Login con PIN ────────────────────────────────────── */
 function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => void }) {
-  const [creating, setCreating] = useState(false);
-  const [name, setName] = useState('');
-  const [role, setRole] = useState<Role>('operatore');
+  const [name, setName] = useState('Simone');
+  const [pin, setPin] = useState('');
+  const [selectedUser, setSelectedUser] = useState<User | null>(null);
+  const [enteredPin, setEnteredPin] = useState('');
+  const [pinError, setPinError] = useState(false);
 
   async function createFirst() {
     const n = name.trim();
-    if (!n) return;
-    const ref = await addDoc(usersCol, { name: n, role });
-    onLogin({ id: ref.id, name: n, role });
+    if (!n || pin.length < 4) return;
+    const ref = await addDoc(usersCol, { name: n, role: 'responsabile', pin });
+    onLogin({ id: ref.id, name: n, role: 'responsabile', pin });
   }
 
-  // Nessun utente: crea il primo (diventa responsabile di default)
+  function handleDigit(d: string) {
+    if (!selectedUser || enteredPin.length >= 4) return;
+    const next = enteredPin + d;
+    setEnteredPin(next);
+    setPinError(false);
+    if (next.length === 4) {
+      if (next === selectedUser.pin) {
+        onLogin(selectedUser);
+      } else {
+        setPinError(true);
+        setTimeout(() => setEnteredPin(''), 450);
+      }
+    }
+  }
+
   if (users.length === 0) {
     return (
-      <div className="mx-auto flex min-h-dvh max-w-sm flex-col justify-center gap-6 px-6">
+      <div className="mx-auto flex min-h-dvh max-w-sm flex-col justify-center gap-5 px-6">
         <div className="text-center">
           <ChefHat className="mx-auto mb-3 size-14 text-basil" />
           <h1 className="font-display text-3xl font-extrabold">KitchenOS</h1>
-          <p className="mt-2 text-ink/60">Crea il primo account (responsabile)</p>
+          <p className="mt-2 text-ink/60">Configura l&apos;account Responsabile</p>
         </div>
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Il tuo nome"
+          placeholder="Nome Responsabile (es. Simone)"
           maxLength={40}
           className="h-14 rounded-2xl bg-white px-4 text-lg ring-1 ring-ink/10"
-          autoFocus
+        />
+        <input
+          type="password"
+          inputMode="numeric"
+          pattern="[0-9]*"
+          maxLength={4}
+          value={pin}
+          onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+          placeholder="Scegli un PIN a 4 cifre"
+          className="h-14 rounded-2xl bg-white px-4 text-center font-display text-2xl tracking-[0.5em] ring-1 ring-ink/10"
         />
         <button
           onClick={createFirst}
-          disabled={!name.trim()}
+          disabled={!name.trim() || pin.length < 4}
           className="h-14 rounded-2xl bg-basil text-lg font-semibold text-white disabled:opacity-40"
         >
-          Inizia
+          Crea account Responsabile
         </button>
+      </div>
+    );
+  }
+
+  if (selectedUser) {
+    return (
+      <div className="mx-auto flex min-h-dvh max-w-xs flex-col justify-center gap-6 px-6">
+        <div className="text-center">
+          <div className="mx-auto mb-3 grid size-14 place-items-center rounded-full bg-basil/15 font-display text-2xl font-extrabold text-basil">
+            {selectedUser.name.charAt(0).toUpperCase()}
+          </div>
+          <h2 className="font-display text-2xl font-extrabold">{selectedUser.name}</h2>
+          <p className="mt-1 text-sm text-ink/60">Inserisci il tuo PIN a 4 cifre</p>
+        </div>
+
+        <div className="flex justify-center gap-4">
+          {[0, 1, 2, 3].map((idx) => (
+            <span
+              key={idx}
+              className={`size-4 rounded-full transition-all ${
+                pinError
+                  ? 'bg-tomato scale-110'
+                  : idx < enteredPin.length
+                    ? 'bg-basil scale-110'
+                    : 'bg-ink/15'
+              }`}
+            />
+          ))}
+        </div>
+        {pinError && <p className="text-center text-sm font-semibold text-tomato">PIN errato</p>}
+
+        <div className="grid grid-cols-3 gap-3">
+          {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((d) => (
+            <button
+              key={d}
+              onClick={() => handleDigit(d)}
+              className="h-16 rounded-2xl bg-white font-display text-2xl font-extrabold shadow-sm ring-1 ring-ink/10 active:bg-paper"
+            >
+              {d}
+            </button>
+          ))}
+          <button
+            onClick={() => {
+              setSelectedUser(null);
+              setEnteredPin('');
+              setPinError(false);
+            }}
+            className="h-16 rounded-2xl bg-paper text-sm font-semibold text-ink/60"
+          >
+            Indietro
+          </button>
+          <button
+            onClick={() => handleDigit('0')}
+            className="h-16 rounded-2xl bg-white font-display text-2xl font-extrabold shadow-sm ring-1 ring-ink/10 active:bg-paper"
+          >
+            0
+          </button>
+          <button
+            onClick={() => {
+              setEnteredPin((p) => p.slice(0, -1));
+              setPinError(false);
+            }}
+            className="h-16 rounded-2xl bg-paper text-sm font-semibold text-ink/60"
+          >
+            Canc
+          </button>
+        </div>
       </div>
     );
   }
@@ -322,42 +520,48 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
       <div className="text-center">
         <ChefHat className="mx-auto mb-3 size-14 text-basil" />
         <h1 className="font-display text-3xl font-extrabold">KitchenOS</h1>
-        <p className="mt-2 text-ink/60">Seleziona il tuo account</p>
+        <p className="mt-2 text-ink/60">Seleziona il tuo account e inserisci il PIN</p>
       </div>
       <ul className="space-y-2">
         {users.map((u) => (
           <button
             key={u.id}
-            onClick={() => onLogin(u)}
+            onClick={() => {
+              setSelectedUser(u);
+              setEnteredPin('');
+              setPinError(false);
+            }}
             className="flex h-14 w-full items-center gap-3 rounded-2xl bg-white px-4 text-left shadow-sm ring-1 ring-ink/10 active:bg-paper"
           >
             <span className="grid size-10 place-items-center rounded-full bg-basil/15 text-lg font-bold text-basil">
               {u.name.charAt(0).toUpperCase()}
             </span>
-            <div>
+            <div className="flex-1">
               <div className="font-semibold">{u.name}</div>
               <div className="text-xs text-ink/50">
                 {u.role === 'responsabile' ? 'Responsabile' : 'Operatore'}
               </div>
             </div>
+            <Lock className="size-4 text-ink/30" />
           </button>
         ))}
       </ul>
       <p className="text-center text-sm text-ink/40">
-        Gli account vengono creati dal responsabile nell&apos;app
+        Gli operatori e i relativi PIN vengono creati dal Responsabile
       </p>
     </div>
   );
 }
 
-/* ─── Sezione Giacenza (inventario) ────────────────────── */
+/* ─── Sezione Giacenza (Cella di congelamento + Magazzino) */
 function InventorySection({ currentUser }: { currentUser: User }) {
-  void currentUser;
+  const isResp = currentUser.role === 'responsabile';
   const [items, setItems] = useState<Item[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [onlyLow, setOnlyLow] = useState(false);
+  const [zoneFilter, setZoneFilter] = useState<'tutti' | StorageZone>('cella_congelamento');
   const [filterCat, setFilterCat] = useState<Category | 'tutti'>('tutti');
   const [draft, setDraft] = useState<Draft | null>(null);
   const [toast, setToast] = useState('');
@@ -369,9 +573,10 @@ function InventorySection({ currentUser }: { currentUser: User }) {
           (d) =>
             ({
               min: 1,
-              unit: 'pz',
+              unit: 'kg',
               quantity: 0,
               category: 'altro',
+              zone: 'cella_congelamento',
               ...(d.data() as object),
               id: d.id,
             }) as Item,
@@ -388,7 +593,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
           (d) =>
             ({
               category: 'altro',
-              unit: 'pz',
+              unit: 'kg',
               defaultMin: 1,
               ...(d.data() as object),
               id: d.id,
@@ -404,16 +609,21 @@ function InventorySection({ currentUser }: { currentUser: User }) {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const low = useMemo(() => items.filter(isLow), [items]);
+  const zoneItems = useMemo(() => {
+    if (zoneFilter === 'tutti') return items;
+    return items.filter((i) => (i.zone ?? 'cella_congelamento') === zoneFilter);
+  }, [items, zoneFilter]);
+
+  const low = useMemo(() => zoneItems.filter(isLow), [zoneItems]);
+
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return (onlyLow ? low : items).filter((i) => {
+    return (onlyLow ? low : zoneItems).filter((i) => {
       if (filterCat !== 'tutti' && i.category !== filterCat) return false;
       return i.name.toLowerCase().includes(q);
     });
-  }, [items, low, onlyLow, search, filterCat]);
+  }, [zoneItems, low, onlyLow, search, filterCat]);
 
-  // Prodotti del catalogo non ancora in giacenza, filtrati dalla ricerca
   const catalogSuggestions = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return [];
@@ -424,10 +634,10 @@ function InventorySection({ currentUser }: { currentUser: User }) {
   }, [products, items, search]);
 
   async function change(i: Item, delta: number) {
-    const next = Math.max(0, i.quantity + delta);
+    const next = Math.max(0, Number((i.quantity + delta).toFixed(2)));
     if (next === i.quantity) return;
     await updateDoc(doc(db, 'items', i.id), {
-      quantity: increment(next - i.quantity),
+      quantity: increment(Number((next - i.quantity).toFixed(2))),
       updatedAt: serverTimestamp(),
     });
     if (!isLow(i) && next <= i.min) {
@@ -436,20 +646,19 @@ function InventorySection({ currentUser }: { currentUser: User }) {
     }
   }
 
-  /** Salva in giacenza e aggiorna lo storico prodotti condiviso. */
   async function saveToCatalogAndStock(
     name: string,
     category: Category,
     unit: string,
     min: number,
     quantity: number,
+    zone: StorageZone,
     itemId?: string,
     productId?: string,
   ) {
     const n = name.trim();
     if (!n) return;
 
-    // 1) Aggiorna / crea nello storico (catalogo)
     let pid = productId;
     const existing = products.find((p) => p.name.toLowerCase() === n.toLowerCase());
     if (existing) {
@@ -458,7 +667,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
         name: n,
         category,
         unit,
-        defaultMin: min,
+        ...(isResp ? { defaultMin: min } : {}),
         updatedAt: serverTimestamp(),
       });
     } else {
@@ -466,20 +675,26 @@ function InventorySection({ currentUser }: { currentUser: User }) {
         name: n,
         category,
         unit,
-        defaultMin: min,
+        defaultMin: isResp ? min : 1,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
       pid = ref.id;
     }
 
-    // 2) Aggiorna / crea in giacenza
+    const safeMin = isResp
+      ? min
+      : itemId
+        ? items.find((x) => x.id === itemId)?.min ?? 1
+        : 1;
+
     const data = {
       name: n,
       quantity,
       unit,
-      min,
+      min: safeMin,
       category,
+      zone,
       productId: pid,
       updatedAt: serverTimestamp(),
     };
@@ -495,6 +710,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       draft.unit,
       draft.min,
       draft.quantity,
+      draft.zone,
       draft.id,
       draft.productId,
     );
@@ -502,19 +718,21 @@ function InventorySection({ currentUser }: { currentUser: User }) {
     setSearch('');
   }
 
-  /** Aggiunge in giacenza un prodotto già presente nel catalogo (1 tap). */
   async function addFromCatalog(p: Product) {
+    const targetZone: StorageZone =
+      zoneFilter === 'magazzino' ? 'magazzino' : 'cella_congelamento';
     await addDoc(itemsCol, {
       name: p.name,
       quantity: 0,
       unit: p.unit,
       min: p.defaultMin,
       category: p.category,
+      zone: targetZone,
       productId: p.id,
       updatedAt: serverTimestamp(),
     });
     setSearch('');
-    setToast(`"${p.name}" aggiunto in giacenza`);
+    setToast(`"${p.name}" aggiunto in ${targetZone === 'cella_congelamento' ? 'Cella' : 'Magazzino'}`);
   }
 
   async function remove() {
@@ -524,7 +742,8 @@ function InventorySection({ currentUser }: { currentUser: User }) {
   }
 
   async function shareList() {
-    const text = 'Lista della spesa:\n' + low.map((i) => `- ${i.name}`).join('\n');
+    const text =
+      'Sotto scorta:\n' + low.map((i) => `- ${i.name} (${i.quantity}/${i.min} ${i.unit})`).join('\n');
     if (navigator.share) {
       try {
         await navigator.share({ text });
@@ -542,10 +761,28 @@ function InventorySection({ currentUser }: { currentUser: User }) {
 
   return (
     <div className="px-4">
-      <p className="mb-3 text-ink/60">
+      <div className="mb-3 grid grid-cols-3 gap-2 rounded-2xl bg-white p-1.5 shadow-sm ring-1 ring-ink/10">
+        {[
+          { id: 'cella_congelamento' as const, label: '❄️ Cella Congel.' },
+          { id: 'magazzino' as const, label: '📦 Magazzino' },
+          { id: 'tutti' as const, label: 'Tutto' },
+        ].map((z) => (
+          <button
+            key={z.id}
+            onClick={() => setZoneFilter(z.id)}
+            className={`h-10 rounded-xl text-xs font-bold transition-colors ${
+              zoneFilter === z.id ? 'bg-basil text-white' : 'text-ink/70'
+            }`}
+          >
+            {z.label}
+          </button>
+        ))}
+      </div>
+
+      <p className="mb-3 text-sm text-ink/60">
         {low.length === 0
           ? 'Tutto in scorta.'
-          : `${low.length} ${low.length === 1 ? 'prodotto da riordinare' : 'prodotti da riordinare'}.`}
+          : `${low.length} ${low.length === 1 ? 'prodotto sotto scorta' : 'prodotti sotto scorta'}.`}
       </p>
 
       <div className="sticky top-0 z-10 -mx-4 space-y-3 bg-paper/95 px-4 pb-3 pt-1 backdrop-blur">
@@ -554,7 +791,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Cerca o aggiungi un prodotto"
+            placeholder="Cerca o aggiungi prodotto in cella"
             className="h-full flex-1 bg-transparent text-base outline-none"
           />
           {search && (
@@ -564,8 +801,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
           )}
         </label>
 
-        {/* Filtri categoria */}
-        <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none">
+        <div className="flex gap-2 overflow-x-auto pb-1">
           <button
             onClick={() => setFilterCat('tutti')}
             className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
@@ -589,8 +825,8 @@ function InventorySection({ currentUser }: { currentUser: User }) {
 
         <div className="flex gap-2">
           {[
-            { label: `Tutti (${items.length})`, value: false },
-            { label: `Da riordinare (${low.length})`, value: true },
+            { label: `Tutti (${zoneItems.length})`, value: false },
+            { label: `Sotto scorta (${low.length})`, value: true },
           ].map((t) => (
             <button
               key={t.label}
@@ -617,11 +853,11 @@ function InventorySection({ currentUser }: { currentUser: User }) {
         <p className="py-16 text-center text-ink/50">Caricamento…</p>
       ) : shown.length === 0 ? (
         <div className="py-16 text-center text-ink/60">
-          <ShoppingBasket className="mx-auto mb-3 size-10" />
-          {items.length === 0
-            ? 'Nessun prodotto. Tocca "Aggiungi" per iniziare.'
+          <Snowflake className="mx-auto mb-3 size-10 text-basil/60" />
+          {zoneItems.length === 0
+            ? 'Nessun prodotto stoccato qui. Tocca "Aggiungi" per inserire.'
             : onlyLow && !search
-              ? 'Niente da riordinare.'
+              ? 'Nessun prodotto sotto scorta.'
               : 'Nessun risultato.'}
         </div>
       ) : (
@@ -642,10 +878,10 @@ function InventorySection({ currentUser }: { currentUser: User }) {
                   </div>
                   <div className={`text-xs ${isLow(i) ? 'font-semibold text-tomato' : 'text-ink/50'}`}>
                     {i.quantity === 0
-                      ? 'Finito'
+                      ? `Finito · ${i.unit}`
                       : isLow(i)
-                        ? `Scorta bassa (min ${i.min})`
-                        : i.unit}
+                        ? `Sotto scorta (min ${i.min} ${i.unit})`
+                        : `${i.unit} · min ${i.min}`}
                   </div>
                 </button>
                 <button
@@ -655,7 +891,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
                 >
                   <Minus className="size-5" />
                 </button>
-                <span className="w-10 text-center font-display text-2xl font-extrabold tabular-nums">
+                <span className="w-12 text-center font-display text-2xl font-extrabold tabular-nums">
                   {i.quantity}
                 </span>
                 <button
@@ -671,10 +907,9 @@ function InventorySection({ currentUser }: { currentUser: User }) {
         </ul>
       )}
 
-      {/* Suggerimenti dallo storico catalogo (prodotti già usati da qualcuno) */}
       {search.trim() && catalogSuggestions.length > 0 && (
         <div className="mt-3 space-y-1.5">
-          <p className="text-xs font-semibold uppercase tracking-wide text-ink/40">Dallo storico</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-ink/40">Dalla merce base</p>
           {catalogSuggestions.map((p) => {
             const cat = CATEGORIES.find((c) => c.id === p.category);
             return (
@@ -687,7 +922,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
                 <span className="flex-1 font-semibold">{p.name}</span>
                 <span className="text-xs text-ink/50">{p.unit}</span>
                 <span className="rounded-full bg-basil/15 px-2 py-0.5 text-xs font-semibold text-basil">
-                  + in giacenza
+                  + stocca
                 </span>
               </button>
             );
@@ -698,7 +933,14 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       {search.trim() && !exact && !exactInCatalog && (
         <button
           onClick={() =>
-            setDraft({ name: search.trim(), quantity: 1, unit: 'pz', min: 1, category: 'altro' })
+            setDraft({
+              name: search.trim(),
+              quantity: 1,
+              unit: 'kg',
+              min: 1,
+              category: 'altro',
+              zone: zoneFilter === 'magazzino' ? 'magazzino' : 'cella_congelamento',
+            })
           }
           className="mt-3 flex h-12 w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-basil font-semibold text-basil"
         >
@@ -707,7 +949,16 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       )}
 
       <button
-        onClick={() => setDraft({ name: '', quantity: 1, unit: 'pz', min: 1, category: 'altro' })}
+        onClick={() =>
+          setDraft({
+            name: '',
+            quantity: 1,
+            unit: 'kg',
+            min: 1,
+            category: 'altro',
+            zone: zoneFilter === 'magazzino' ? 'magazzino' : 'cella_congelamento',
+          })
+        }
         className="fixed bottom-20 left-1/2 z-20 flex h-14 -translate-x-1/2 items-center gap-2 rounded-full bg-ink px-7 text-base font-semibold text-white shadow-lg active:scale-95"
       >
         <Plus className="size-5" /> Aggiungi
@@ -723,7 +974,14 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       )}
 
       {draft && (
-        <ItemSheet draft={draft} setDraft={setDraft} onSave={save} onDelete={remove} onClose={() => setDraft(null)} />
+        <ItemSheet
+          draft={draft}
+          setDraft={setDraft}
+          canEditMin={isResp}
+          onSave={save}
+          onDelete={remove}
+          onClose={() => setDraft(null)}
+        />
       )}
     </div>
   );
@@ -765,12 +1023,14 @@ function Stepper({
 function ItemSheet({
   draft,
   setDraft,
+  canEditMin,
   onSave,
   onDelete,
   onClose,
 }: {
   draft: Draft;
   setDraft: (d: Draft) => void;
+  canEditMin: boolean;
   onSave: () => void;
   onDelete: () => void;
   onClose: () => void;
@@ -779,7 +1039,7 @@ function ItemSheet({
   return (
     <div className="fixed inset-0 z-40 flex items-end bg-ink/40" onClick={onClose}>
       <div
-        className="mx-auto w-full max-w-xl space-y-4 rounded-t-3xl bg-white p-5 pb-10"
+        className="mx-auto max-h-[90dvh] w-full max-w-xl space-y-4 overflow-y-auto rounded-t-3xl bg-white p-5 pb-10"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between">
@@ -790,14 +1050,35 @@ function ItemSheet({
             <X className="size-6" />
           </button>
         </div>
+
         <input
           autoFocus={!draft.id && !draft.name}
           value={draft.name}
           onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-          placeholder="Nome (es. Farina 00)"
+          placeholder="Nome (es. Petto di pollo, Patate)"
           maxLength={60}
           className="h-12 w-full rounded-xl bg-paper px-4 text-base"
         />
+
+        <div>
+          <p className="mb-2 text-sm font-semibold">Dove è stoccato</p>
+          <div className="grid grid-cols-2 gap-2">
+            {[
+              { id: 'cella_congelamento' as const, label: '❄️ Cella di congelamento' },
+              { id: 'magazzino' as const, label: '📦 Magazzino / Frigo' },
+            ].map((z) => (
+              <button
+                key={z.id}
+                onClick={() => setDraft({ ...draft, zone: z.id })}
+                className={`h-11 rounded-xl text-sm font-semibold ${
+                  draft.zone === z.id ? 'bg-basil text-white' : 'bg-paper'
+                }`}
+              >
+                {z.label}
+              </button>
+            ))}
+          </div>
+        </div>
 
         <div>
           <p className="mb-2 text-sm font-semibold">Categoria</p>
@@ -816,9 +1097,14 @@ function ItemSheet({
           </div>
         </div>
 
-        <Stepper label="Quantità" value={draft.quantity} onChange={(n) => setDraft({ ...draft, quantity: n })} />
+        <Stepper
+          label="Quantità attuale"
+          value={draft.quantity}
+          onChange={(n) => setDraft({ ...draft, quantity: n })}
+        />
+
         <div className="flex gap-2">
-          {UNITS.map((u) => (
+          {STOCK_UNITS.map((u) => (
             <button
               key={u}
               onClick={() => setDraft({ ...draft, unit: u })}
@@ -830,12 +1116,29 @@ function ItemSheet({
             </button>
           ))}
         </div>
-        <div>
-          <Stepper label="Avvisami sotto" value={draft.min} onChange={(n) => setDraft({ ...draft, min: n })} />
-          <p className="mt-1 text-sm text-ink/50">
-            Sotto o uguale a questa quantità il prodotto va da riordinare.
-          </p>
-        </div>
+
+        {canEditMin ? (
+          <div className="rounded-2xl bg-paper p-3">
+            <Stepper
+              label="Sotto scorta (Responsabile)"
+              value={draft.min}
+              onChange={(n) => setDraft({ ...draft, min: n })}
+            />
+            <p className="mt-1 text-xs text-ink/50">
+              Sotto o uguale a questa soglia il prodotto viene segnalato da riordinare.
+            </p>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between rounded-2xl bg-paper px-4 py-3 text-sm text-ink/60">
+            <span className="flex items-center gap-1.5 font-medium">
+              <Lock className="size-4" /> Soglia sotto scorta
+            </span>
+            <span className="font-bold text-ink">
+              {draft.min} {draft.unit} (solo Responsabile)
+            </span>
+          </div>
+        )}
+
         <button
           onClick={onSave}
           disabled={!draft.name.trim()}
@@ -843,12 +1146,14 @@ function ItemSheet({
         >
           Salva
         </button>
+
         {draft.id && (
           <button
             onClick={() => (confirmDel ? onDelete() : setConfirmDel(true))}
             className="flex h-11 w-full items-center justify-center gap-2 font-semibold text-tomato"
           >
-            <Trash2 className="size-5" /> {confirmDel ? 'Tocca ancora per eliminare' : 'Elimina prodotto'}
+            <Trash2 className="size-5" />{' '}
+            {confirmDel ? 'Tocca ancora per eliminare' : 'Elimina prodotto'}
           </button>
         )}
       </div>
@@ -856,49 +1161,39 @@ function ItemSheet({
   );
 }
 
-/* ─── Sezione Ordini ───────────────────────────────────── */
+/* ─── Sezione Ordini (tutta la merce base in kg o cartoni) */
+type BaseCatalogRow = {
+  key: string;
+  name: string;
+  category: Category;
+  stockQty?: number;
+  stockUnit?: string;
+  low?: boolean;
+};
+
 function OrdersSection({ currentUser }: { currentUser: User }) {
   const [orders, setOrders] = useState<Order[]>([]);
   const [items, setItems] = useState<Item[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
   const [showNew, setShowNew] = useState(false);
-  const [selected, setSelected] = useState<Record<string, number>>({});
+  const [draftLines, setDraftLines] = useState<Record<string, { qty: number; unit: OrderUnit }>>({});
+  const [orderSearch, setOrderSearch] = useState('');
   const [note, setNote] = useState('');
   const [filterCat, setFilterCat] = useState<Category | 'tutti'>('tutti');
+  const [filterOperator, setFilterOperator] = useState<string>('tutti');
   const [toast, setToast] = useState('');
-  const knownIds = useRef<Set<string>>(new Set());
   const isResp = currentUser.role === 'responsabile';
 
-  // Ascolta ordini (tutti, filtrati lato client per evitare indici compositi)
   useEffect(() => {
     return onSnapshot(query(ordersCol, orderBy('createdAt', 'desc')), (snap) => {
       let list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Order, 'id'>) }));
       if (!isResp) {
         list = list.filter((o) => o.operatorId === currentUser.id);
       }
-      // Notifica solo il responsabile per nuovi ordini pending
-      if (isResp) {
-        list.forEach((o) => {
-          if (o.status === 'pending' && !knownIds.current.has(o.id)) {
-            if (knownIds.current.size > 0) {
-              // non al primo caricamento
-              playNotifySound();
-              showBrowserNotification(
-                'Nuovo ordine',
-                `${o.operatorName}: ${o.lines.map((l) => l.name).join(', ')}`,
-              );
-              setToast(`Nuovo ordine da ${o.operatorName}`);
-            }
-            knownIds.current.add(o.id);
-          } else {
-            knownIds.current.add(o.id);
-          }
-        });
-      }
       setOrders(list);
     });
   }, [currentUser.id, isResp]);
 
-  // Items per creare ordine
   useEffect(() => {
     return onSnapshot(query(itemsCol, orderBy('name')), (snap) => {
       setItems(
@@ -906,12 +1201,30 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
           (d) =>
             ({
               min: 1,
-              unit: 'pz',
+              unit: 'kg',
               quantity: 0,
               category: 'altro',
+              zone: 'cella_congelamento',
               ...(d.data() as object),
               id: d.id,
             }) as Item,
+        ),
+      );
+    });
+  }, []);
+
+  useEffect(() => {
+    return onSnapshot(query(productsCol, orderBy('name')), (snap) => {
+      setProducts(
+        snap.docs.map(
+          (d) =>
+            ({
+              category: 'altro',
+              unit: 'kg',
+              defaultMin: 1,
+              ...(d.data() as object),
+              id: d.id,
+            }) as Product,
         ),
       );
     });
@@ -923,38 +1236,78 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const lowItems = useMemo(() => items.filter(isLow), [items]);
-  const orderable = useMemo(() => {
-    const base = lowItems.length > 0 ? lowItems : items;
-    if (filterCat === 'tutti') return base;
-    return base.filter((i) => i.category === filterCat);
-  }, [items, lowItems, filterCat]);
+  const allBaseProducts = useMemo<BaseCatalogRow[]>(() => {
+    const map = new Map<string, BaseCatalogRow>();
+    products.forEach((p) => {
+      const k = p.name.trim().toLowerCase();
+      map.set(k, {
+        key: k,
+        name: p.name,
+        category: p.category,
+      });
+    });
+    items.forEach((i) => {
+      const k = i.name.trim().toLowerCase();
+      const prev = map.get(k);
+      map.set(k, {
+        key: k,
+        name: i.name,
+        category: i.category || prev?.category || 'altro',
+        stockQty: i.quantity,
+        stockUnit: i.unit,
+        low: isLow(i),
+      });
+    });
+    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name, 'it'));
+  }, [products, items]);
 
-  function toggleLine(item: Item) {
-    setSelected((prev) => {
+  const filteredBaseProducts = useMemo(() => {
+    const q = orderSearch.trim().toLowerCase();
+    return allBaseProducts.filter((p) => {
+      if (filterCat !== 'tutti' && p.category !== filterCat) return false;
+      return !q || p.name.toLowerCase().includes(q);
+    });
+  }, [allBaseProducts, filterCat, orderSearch]);
+
+  function setLineQty(row: BaseCatalogRow, qty: number, unit?: OrderUnit) {
+    setDraftLines((prev) => {
       const next = { ...prev };
-      if (next[item.id]) delete next[item.id];
-      else next[item.id] = Math.max(1, item.min - item.quantity + 1) || 1;
+      const currentUnit = unit ?? prev[row.key]?.unit ?? 'kg';
+      if (qty <= 0) {
+        delete next[row.key];
+      } else {
+        next[row.key] = { qty: Number(qty.toFixed(2)), unit: currentUnit };
+      }
       return next;
     });
   }
 
-  function setQty(id: string, qty: number) {
-    setSelected((prev) => ({ ...prev, [id]: Math.max(1, qty) }));
+  function setLineUnit(row: BaseCatalogRow, unit: OrderUnit) {
+    setDraftLines((prev) => {
+      const existing = prev[row.key];
+      return {
+        ...prev,
+        [row.key]: { qty: existing ? existing.qty : 1, unit },
+      };
+    });
   }
 
   async function submitOrder() {
-    const lines: OrderLine[] = Object.entries(selected).map(([itemId, quantity]) => {
-      const it = items.find((i) => i.id === itemId)!;
-      return {
-        itemId,
-        name: it.name,
-        quantity,
-        unit: it.unit,
-        category: it.category,
-      };
-    });
+    const lines: OrderLine[] = Object.entries(draftLines)
+      .filter(([, v]) => v.qty > 0)
+      .map(([key, v]) => {
+        const prod = allBaseProducts.find((p) => p.key === key)!;
+        return {
+          productKey: key,
+          name: prod.name,
+          quantity: v.qty,
+          unit: v.unit,
+          category: prod.category,
+        };
+      });
+
     if (lines.length === 0) return;
+
     await addDoc(ordersCol, {
       operatorId: currentUser.id,
       operatorName: currentUser.name,
@@ -963,197 +1316,282 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
       status: 'pending',
       createdAt: serverTimestamp(),
     });
-    setSelected({});
+
+    fetch('/api/notify-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        operatorName: currentUser.name,
+        lines,
+      }),
+    }).catch(() => {});
+
+    setDraftLines({});
     setNote('');
+    setOrderSearch('');
     setShowNew(false);
-    setToast('Ordine inviato al responsabile');
+    setToast('Lista inviata al Responsabile');
   }
 
   async function setStatus(id: string, status: Order['status']) {
     await updateDoc(doc(db, 'orders', id), { status });
   }
 
+  const operatorsInOrders = useMemo(() => {
+    const names = Array.from(new Set(orders.map((o) => o.operatorName)));
+    return names.sort((a, b) => a.localeCompare(b, 'it'));
+  }, [orders]);
+
+  const visibleOrders = useMemo(() => {
+    if (!isResp || filterOperator === 'tutti') return orders;
+    return orders.filter((o) => o.operatorName === filterOperator);
+  }, [orders, isResp, filterOperator]);
+
   const pendingCount = orders.filter((o) => o.status === 'pending').length;
+  const compiledCount = Object.keys(draftLines).length;
 
   return (
     <div className="px-4">
       <div className="mb-4 flex items-center justify-between">
         <div>
           <h2 className="font-display text-xl font-extrabold">
-            {isResp ? 'Ordini ricevuti' : 'I miei ordini'}
+            {isResp ? 'Ordini da tutti gli operatori' : 'Ordini cucina'}
           </h2>
           {isResp && pendingCount > 0 && (
-            <p className="text-sm font-semibold text-tomato">{pendingCount} in attesa</p>
+            <p className="text-sm font-semibold text-tomato">{pendingCount} da gestire</p>
           )}
         </div>
-        {!isResp && (
-          <button
-            onClick={() => setShowNew(true)}
-            className="flex h-11 items-center gap-2 rounded-full bg-basil px-4 text-sm font-semibold text-white"
-          >
-            <Send className="size-4" /> Nuovo ordine
-          </button>
-        )}
+        <button
+          onClick={() => setShowNew(true)}
+          className="flex h-11 items-center gap-2 rounded-full bg-basil px-4 text-sm font-semibold text-white shadow-sm"
+        >
+          <Plus className="size-4" /> Compila lista
+        </button>
       </div>
 
-      {orders.length === 0 ? (
+      {isResp && operatorsInOrders.length > 0 && (
+        <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
+          <button
+            onClick={() => setFilterOperator('tutti')}
+            className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ${
+              filterOperator === 'tutti' ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+            }`}
+          >
+            Tutti ({orders.length})
+          </button>
+          {operatorsInOrders.map((op) => (
+            <button
+              key={op}
+              onClick={() => setFilterOperator(op)}
+              className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ${
+                filterOperator === op ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+              }`}
+            >
+              {op}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {visibleOrders.length === 0 ? (
         <div className="py-16 text-center text-ink/60">
           <ShoppingBasket className="mx-auto mb-3 size-10" />
-          {isResp ? 'Nessun ordine ancora.' : 'Non hai ancora inviato ordini.'}
+          {isResp
+            ? 'Nessun ordine ricevuto ancora.'
+            : 'Tocca "Compila lista" per inserire i quantitativi in kg o cartoni.'}
         </div>
       ) : (
         <ul className="space-y-3">
-          {orders.map((o) => {
-            const catGroups = CATEGORIES.filter((c) => o.lines.some((l) => l.category === c.id));
-            return (
-              <li key={o.id} className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
-                <div className="mb-2 flex items-start justify-between gap-2">
-                  <div>
-                    <div className="font-semibold">
-                      {isResp ? o.operatorName : 'Il tuo ordine'}
-                    </div>
-                    <div className="text-xs text-ink/50">
-                      {o.createdAt
-                        ? new Date(o.createdAt.seconds * 1000).toLocaleString('it-IT', {
-                            day: '2-digit',
-                            month: 'short',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })
-                        : '…'}
-                    </div>
+          {visibleOrders.map((o) => (
+            <li key={o.id} className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-base font-bold">
+                    {isResp ? `Operatore: ${o.operatorName}` : 'Lista inviata'}
                   </div>
-                  <StatusBadge status={o.status} />
+                  <div className="text-xs text-ink/50">
+                    {o.createdAt
+                      ? new Date(o.createdAt.seconds * 1000).toLocaleString('it-IT', {
+                          day: '2-digit',
+                          month: 'short',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })
+                      : 'Invio in corso…'}
+                  </div>
                 </div>
-                <ul className="mb-2 space-y-1">
-                  {o.lines.map((l, idx) => {
-                    const cat = CATEGORIES.find((c) => c.id === l.category);
-                    return (
-                      <li key={idx} className="flex items-center gap-2 text-sm">
-                        <span>{cat?.emoji}</span>
-                        <span className="flex-1">{l.name}</span>
-                        <span className="font-semibold tabular-nums">
-                          {l.quantity} {l.unit}
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-                {o.note && <p className="mb-2 text-sm italic text-ink/60">&ldquo;{o.note}&rdquo;</p>}
-                {isResp && o.status === 'pending' && (
-                  <div className="mt-2 flex gap-2">
-                    <button
-                      onClick={() => setStatus(o.id, 'received')}
-                      className="flex h-9 flex-1 items-center justify-center gap-1 rounded-xl bg-basil text-sm font-semibold text-white"
-                    >
-                      <Check className="size-4" /> Preso in carico
-                    </button>
-                  </div>
-                )}
-                {isResp && o.status === 'received' && (
-                  <button
-                    onClick={() => setStatus(o.id, 'done')}
-                    className="mt-2 flex h-9 w-full items-center justify-center gap-1 rounded-xl bg-ink text-sm font-semibold text-white"
-                  >
-                    <Check className="size-4" /> Completato
-                  </button>
-                )}
-              </li>
-            );
-          })}
+                <StatusBadge status={o.status} />
+              </div>
+              <ul className="mb-2 divide-y divide-ink/5">
+                {o.lines.map((l, idx) => {
+                  const cat = CATEGORIES.find((c) => c.id === l.category);
+                  return (
+                    <li key={idx} className="flex items-center gap-2 py-1.5 text-sm">
+                      <span>{cat?.emoji}</span>
+                      <span className="flex-1 font-medium">{l.name}</span>
+                      <span className="rounded-lg bg-paper px-2.5 py-0.5 font-bold tabular-nums">
+                        {l.quantity} {l.unit}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+              {o.note && <p className="mb-2 text-sm italic text-ink/60">&ldquo;{o.note}&rdquo;</p>}
+              {isResp && o.status === 'pending' && (
+                <button
+                  onClick={() => setStatus(o.id, 'received')}
+                  className="mt-2 flex h-10 w-full items-center justify-center gap-1 rounded-xl bg-basil text-sm font-semibold text-white"
+                >
+                  <Check className="size-4" /> Preso in carico
+                </button>
+              )}
+              {isResp && o.status === 'received' && (
+                <button
+                  onClick={() => setStatus(o.id, 'done')}
+                  className="mt-2 flex h-10 w-full items-center justify-center gap-1 rounded-xl bg-ink text-sm font-semibold text-white"
+                >
+                  <Check className="size-4" /> Segna completato
+                </button>
+              )}
+            </li>
+          ))}
         </ul>
       )}
 
-      {/* Modal nuovo ordine (operatore) */}
       {showNew && (
         <div className="fixed inset-0 z-40 flex items-end bg-ink/40" onClick={() => setShowNew(false)}>
           <div
-            className="mx-auto flex max-h-[85dvh] w-full max-w-xl flex-col rounded-t-3xl bg-white"
+            className="mx-auto flex h-[90dvh] w-full max-w-xl flex-col rounded-t-3xl bg-white"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-ink/10 p-4">
-              <h2 className="font-display text-xl font-extrabold">Nuovo ordine</h2>
+              <div>
+                <h2 className="font-display text-xl font-extrabold">Lista merce cucina</h2>
+                <p className="text-xs text-ink/50">Inserisci i quantitativi in kg o cartoni</p>
+              </div>
               <button onClick={() => setShowNew(false)}>
                 <X className="size-6" />
               </button>
             </div>
 
-            <div className="flex gap-2 overflow-x-auto px-4 pt-3 pb-1">
-              <button
-                onClick={() => setFilterCat('tutti')}
-                className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
-                  filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-paper'
-                }`}
-              >
-                Tutti
-              </button>
-              {CATEGORIES.map((c) => (
+            <div className="space-y-2 px-4 pt-3">
+              <label className="flex h-11 items-center gap-2 rounded-xl bg-paper px-3">
+                <Search className="size-4 text-ink/50" />
+                <input
+                  value={orderSearch}
+                  onChange={(e) => setOrderSearch(e.target.value)}
+                  placeholder="Cerca prodotto nella merce base..."
+                  className="h-full flex-1 bg-transparent text-sm outline-none"
+                />
+                {orderSearch && (
+                  <button onClick={() => setOrderSearch('')}>
+                    <X className="size-4 text-ink/50" />
+                  </button>
+                )}
+              </label>
+
+              <div className="flex gap-2 overflow-x-auto pb-1">
                 <button
-                  key={c.id}
-                  onClick={() => setFilterCat(c.id)}
-                  className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
-                    filterCat === c.id ? 'bg-ink text-white' : 'bg-paper'
+                  onClick={() => setFilterCat('tutti')}
+                  className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
+                    filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-paper'
                   }`}
                 >
-                  {c.emoji} {c.label}
+                  Tutti ({allBaseProducts.length})
                 </button>
-              ))}
+                {CATEGORIES.map((c) => (
+                  <button
+                    key={c.id}
+                    onClick={() => setFilterCat(c.id)}
+                    className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
+                      filterCat === c.id ? 'bg-ink text-white' : 'bg-paper'
+                    }`}
+                  >
+                    {c.emoji} {c.label}
+                  </button>
+                ))}
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto px-4 py-2">
-              <p className="mb-2 text-sm text-ink/50">
-                {lowItems.length > 0
-                  ? 'Prodotti sotto scorta (seleziona quelli da ordinare)'
-                  : 'Seleziona i prodotti da ordinare'}
-              </p>
-              {orderable.length === 0 ? (
-                <p className="py-8 text-center text-ink/50">Nessun prodotto in questa categoria</p>
+              {filteredBaseProducts.length === 0 ? (
+                <p className="py-10 text-center text-sm text-ink/50">
+                  Nessun prodotto trovato. Aggiungi prima i prodotti base in &quot;Merce Base&quot;.
+                </p>
               ) : (
                 <ul className="space-y-2">
-                  {orderable.map((i) => {
-                    const sel = selected[i.id];
-                    const cat = CATEGORIES.find((c) => c.id === i.category);
+                  {filteredBaseProducts.map((row) => {
+                    const entry = draftLines[row.key];
+                    const qty = entry?.qty ?? 0;
+                    const unit: OrderUnit = entry?.unit ?? 'kg';
+                    const cat = CATEGORIES.find((c) => c.id === row.category);
                     return (
                       <li
-                        key={i.id}
-                        className={`flex items-center gap-3 rounded-xl p-3 ring-1 ${
-                          sel ? 'bg-basil/10 ring-basil/40' : 'bg-paper ring-transparent'
+                        key={row.key}
+                        className={`rounded-2xl p-3 ring-1 transition-colors ${
+                          qty > 0 ? 'bg-basil/10 ring-basil/40' : 'bg-paper ring-transparent'
                         }`}
                       >
-                        <button className="min-w-0 flex-1 text-left" onClick={() => toggleLine(i)}>
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              <span>{cat?.emoji}</span>
+                              <span className="truncate font-semibold">{row.name}</span>
+                            </div>
+                            {row.stockQty !== undefined && (
+                              <div className="text-xs text-ink/50">
+                                Giacenza: {row.stockQty} {row.stockUnit}
+                                {row.low && (
+                                  <span className="ml-1 font-semibold text-tomato">· sotto scorta</span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+
                           <div className="flex items-center gap-1.5">
-                            <span>{cat?.emoji}</span>
-                            <span className="font-semibold">{i.name}</span>
-                          </div>
-                          <div className="text-xs text-ink/50">
-                            In magazzino: {i.quantity} {i.unit}
-                            {isLow(i) && <span className="ml-1 text-tomato">· sotto scorta</span>}
-                          </div>
-                        </button>
-                        {sel ? (
-                          <div className="flex items-center gap-1">
                             <button
-                              onClick={() => setQty(i.id, sel - 1)}
-                              className="grid size-9 place-items-center rounded-lg bg-white"
+                              onClick={() => setLineQty(row, Math.max(0, qty - 1), unit)}
+                              className="grid size-9 place-items-center rounded-xl bg-white shadow-xs"
                             >
                               <Minus className="size-4" />
                             </button>
-                            <span className="w-8 text-center font-bold tabular-nums">{sel}</span>
+                            <input
+                              type="number"
+                              inputMode="decimal"
+                              min={0}
+                              step="0.5"
+                              value={qty === 0 ? '' : qty}
+                              placeholder="0"
+                              onChange={(e) => {
+                                const val = parseFloat(e.target.value);
+                                setLineQty(row, Number.isFinite(val) ? val : 0, unit);
+                              }}
+                              className="h-9 w-14 rounded-xl bg-white text-center font-display text-base font-extrabold tabular-nums outline-none ring-1 ring-ink/10"
+                            />
                             <button
-                              onClick={() => setQty(i.id, sel + 1)}
-                              className="grid size-9 place-items-center rounded-lg bg-white"
+                              onClick={() => setLineQty(row, qty + 1, unit)}
+                              className="grid size-9 place-items-center rounded-xl bg-white shadow-xs"
                             >
                               <Plus className="size-4" />
                             </button>
                           </div>
-                        ) : (
-                          <button
-                            onClick={() => toggleLine(i)}
-                            className="grid size-9 place-items-center rounded-lg bg-white"
-                          >
-                            <Plus className="size-4" />
-                          </button>
-                        )}
+                        </div>
+
+                        <div className="mt-2 flex justify-end gap-1.5">
+                          {ORDER_UNITS.map((u) => (
+                            <button
+                              key={u}
+                              onClick={() => setLineUnit(row, u)}
+                              className={`rounded-lg px-3 py-1 text-xs font-bold ${
+                                unit === u
+                                  ? 'bg-ink text-white'
+                                  : 'bg-white text-ink/70 ring-1 ring-ink/10'
+                              }`}
+                            >
+                              {u}
+                            </button>
+                          ))}
+                        </div>
                       </li>
                     );
                   })}
@@ -1161,20 +1599,20 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
               )}
             </div>
 
-            <div className="space-y-3 border-t border-ink/10 p-4">
+            <div className="space-y-3 border-t border-ink/10 bg-white p-4">
               <input
                 value={note}
                 onChange={(e) => setNote(e.target.value)}
-                placeholder="Nota (opzionale)"
+                placeholder="Note aggiuntive per il responsabile (opzionale)"
                 maxLength={120}
                 className="h-11 w-full rounded-xl bg-paper px-3 text-sm"
               />
               <button
                 onClick={submitOrder}
-                disabled={Object.keys(selected).length === 0}
-                className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-base font-semibold text-white disabled:opacity-40"
+                disabled={compiledCount === 0}
+                className="flex h-13 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-base font-bold text-white shadow-md disabled:opacity-40"
               >
-                <Send className="size-5" /> Invia ordine ({Object.keys(selected).length})
+                <Send className="size-5" /> Invia a responsabile ({compiledCount} prodotti)
               </button>
             </div>
           </div>
@@ -1205,8 +1643,9 @@ function StatusBadge({ status }: { status: Order['status'] }) {
   );
 }
 
-/* ─── Sezione Catalogo / Storico derrate ────────────────── */
-function CatalogSection() {
+/* ─── Sezione Catalogo / Merce Base ────────────────────── */
+function CatalogSection({ currentUser }: { currentUser: User }) {
+  const isResp = currentUser.role === 'responsabile';
   const [products, setProducts] = useState<Product[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [search, setSearch] = useState('');
@@ -1227,7 +1666,7 @@ function CatalogSection() {
           (d) =>
             ({
               category: 'altro',
-              unit: 'pz',
+              unit: 'kg',
               defaultMin: 1,
               ...(d.data() as object),
               id: d.id,
@@ -1244,9 +1683,10 @@ function CatalogSection() {
           (d) =>
             ({
               min: 1,
-              unit: 'pz',
+              unit: 'kg',
               quantity: 0,
               category: 'altro',
+              zone: 'cella_congelamento',
               ...(d.data() as object),
               id: d.id,
             }) as Item,
@@ -1269,10 +1709,7 @@ function CatalogSection() {
     });
   }, [products, search, filterCat]);
 
-  const inStockNames = useMemo(
-    () => new Set(items.map((i) => i.name.toLowerCase())),
-    [items],
-  );
+  const inStockNames = useMemo(() => new Set(items.map((i) => i.name.toLowerCase())), [items]);
 
   async function saveProduct() {
     if (!draft || !draft.name.trim()) return;
@@ -1281,7 +1718,7 @@ function CatalogSection() {
       name: n,
       category: draft.category,
       unit: draft.unit,
-      defaultMin: draft.defaultMin,
+      ...(isResp ? { defaultMin: draft.defaultMin } : {}),
       updatedAt: serverTimestamp(),
     };
     if (draft.id) {
@@ -1289,23 +1726,27 @@ function CatalogSection() {
     } else {
       const exists = products.some((p) => p.name.toLowerCase() === n.toLowerCase());
       if (exists) {
-        setToast('Prodotto già presente nello storico');
+        setToast('Prodotto già presente');
         return;
       }
-      await addDoc(productsCol, { ...data, createdAt: serverTimestamp() });
+      await addDoc(productsCol, {
+        ...data,
+        defaultMin: isResp ? draft.defaultMin : 1,
+        createdAt: serverTimestamp(),
+      });
     }
     setDraft(null);
-    setToast('Storico aggiornato');
+    setToast('Merce base aggiornata');
   }
 
   async function removeProduct(id: string) {
     await deleteDoc(doc(db, 'products', id));
-    setToast('Rimosso dallo storico');
+    setToast('Prodotto rimosso');
   }
 
   async function addToStock(p: Product) {
     if (inStockNames.has(p.name.toLowerCase())) {
-      setToast('Già in giacenza');
+      setToast('Già presente in giacenza');
       return;
     }
     await addDoc(itemsCol, {
@@ -1314,18 +1755,18 @@ function CatalogSection() {
       unit: p.unit,
       min: p.defaultMin,
       category: p.category,
+      zone: 'cella_congelamento',
       productId: p.id,
       updatedAt: serverTimestamp(),
     });
-    setToast(`"${p.name}" aggiunto in giacenza`);
+    setToast(`"${p.name}" aggiunto in Cella`);
   }
 
   return (
     <div className="px-4">
-      <h2 className="mb-1 font-display text-xl font-extrabold">Catalogo / Storico</h2>
+      <h2 className="mb-1 font-display text-xl font-extrabold">Merce Base Cucina</h2>
       <p className="mb-4 text-sm text-ink/60">
-        Elenco condiviso delle derrate. Una volta inserito, il prodotto appare a tutti e non serve
-        più digitarlo a mano.
+        Elenco di tutta la merce base disponibile per gli ordini e lo stoccaggio in cella.
       </p>
 
       <label className="mb-3 flex h-12 items-center gap-3 rounded-2xl bg-white px-4 shadow-sm ring-1 ring-ink/10">
@@ -1333,7 +1774,7 @@ function CatalogSection() {
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Cerca nello storico"
+          placeholder="Cerca nella merce base"
           className="h-full flex-1 bg-transparent outline-none"
         />
         {search && (
@@ -1369,7 +1810,7 @@ function CatalogSection() {
         <div className="py-12 text-center text-ink/50">
           <BookOpen className="mx-auto mb-3 size-10" />
           {products.length === 0
-            ? 'Storico vuoto. Aggiungi prodotti dalla Giacenza: verranno salvati qui automaticamente.'
+            ? 'Nessun prodotto base inserito. Tocca "+ Nuovo prodotto base" per iniziare.'
             : 'Nessun risultato.'}
         </div>
       ) : (
@@ -1399,7 +1840,7 @@ function CatalogSection() {
                     <span className="truncate font-semibold">{p.name}</span>
                   </div>
                   <div className="text-xs text-ink/50">
-                    {p.unit} · min. {p.defaultMin}
+                    {p.unit} · sotto scorta: {p.defaultMin}
                     {stocked ? ' · in giacenza' : ''}
                   </div>
                 </button>
@@ -1408,16 +1849,18 @@ function CatalogSection() {
                     onClick={() => addToStock(p)}
                     className="rounded-full bg-basil/15 px-3 py-1.5 text-xs font-semibold text-basil"
                   >
-                    + Giacenza
+                    + Cella
                   </button>
                 )}
-                <button
-                  onClick={() => removeProduct(p.id)}
-                  className="grid size-9 place-items-center rounded-xl text-tomato"
-                  aria-label={`Elimina ${p.name}`}
-                >
-                  <Trash2 className="size-4" />
-                </button>
+                {isResp && (
+                  <button
+                    onClick={() => removeProduct(p.id)}
+                    className="grid size-9 place-items-center rounded-xl text-tomato"
+                    aria-label={`Elimina ${p.name}`}
+                  >
+                    <Trash2 className="size-4" />
+                  </button>
+                )}
               </li>
             );
           })}
@@ -1426,11 +1869,11 @@ function CatalogSection() {
 
       <button
         onClick={() =>
-          setDraft({ name: search.trim(), category: 'altro', unit: 'pz', defaultMin: 1 })
+          setDraft({ name: search.trim(), category: 'altro', unit: 'kg', defaultMin: 1 })
         }
         className="fixed bottom-20 left-1/2 z-20 flex h-14 -translate-x-1/2 items-center gap-2 rounded-full bg-ink px-7 text-base font-semibold text-white shadow-lg active:scale-95"
       >
-        <Plus className="size-5" /> Nuovo nello storico
+        <Plus className="size-5" /> Nuovo prodotto base
       </button>
 
       {draft && (
@@ -1441,7 +1884,7 @@ function CatalogSection() {
           >
             <div className="flex items-center justify-between">
               <h3 className="font-display text-xl font-extrabold">
-                {draft.id ? 'Modifica prodotto' : 'Nuovo nello storico'}
+                {draft.id ? 'Modifica prodotto base' : 'Nuovo prodotto base'}
               </h3>
               <button onClick={() => setDraft(null)}>
                 <X className="size-6" />
@@ -1472,7 +1915,7 @@ function CatalogSection() {
               </div>
             </div>
             <div className="flex gap-2">
-              {UNITS.map((u) => (
+              {STOCK_UNITS.map((u) => (
                 <button
                   key={u}
                   onClick={() => setDraft({ ...draft, unit: u })}
@@ -1484,17 +1927,19 @@ function CatalogSection() {
                 </button>
               ))}
             </div>
-            <Stepper
-              label="Soglia minima predefinita"
-              value={draft.defaultMin}
-              onChange={(n) => setDraft({ ...draft, defaultMin: n })}
-            />
+            {isResp && (
+              <Stepper
+                label="Sotto scorta predefinito (Responsabile)"
+                value={draft.defaultMin}
+                onChange={(n) => setDraft({ ...draft, defaultMin: n })}
+              />
+            )}
             <button
               onClick={saveProduct}
               disabled={!draft.name.trim()}
               className="h-12 w-full rounded-2xl bg-basil font-semibold text-white disabled:opacity-40"
             >
-              Salva nello storico
+              Salva prodotto base
             </button>
           </div>
         </div>
@@ -1512,10 +1957,13 @@ function CatalogSection() {
   );
 }
 
-/* ─── Sezione Account (solo responsabile) ──────────────── */
+/* ─── Sezione Account con PIN (solo Responsabile) ──────── */
 function AccountsSection({ users }: { users: User[] }) {
   const [name, setName] = useState('');
+  const [pin, setPin] = useState('');
   const [role, setRole] = useState<Role>('operatore');
+  const [editingPinId, setEditingPinId] = useState<string | null>(null);
+  const [newPinValue, setNewPinValue] = useState('');
   const [toast, setToast] = useState('');
 
   useEffect(() => {
@@ -1526,15 +1974,24 @@ function AccountsSection({ users }: { users: User[] }) {
 
   async function addUser() {
     const n = name.trim();
-    if (!n) return;
+    if (!n || pin.length < 4) return;
     if (users.some((u) => u.name.toLowerCase() === n.toLowerCase())) {
       setToast('Nome già presente');
       return;
     }
-    await addDoc(usersCol, { name: n, role });
+    await addDoc(usersCol, { name: n, role, pin });
     setName('');
+    setPin('');
     setRole('operatore');
-    setToast(`Account "${n}" creato`);
+    setToast(`Operatore "${n}" creato con PIN`);
+  }
+
+  async function saveNewPin(userId: string) {
+    if (newPinValue.length < 4) return;
+    await updateDoc(doc(db, 'users', userId), { pin: newPinValue });
+    setEditingPinId(null);
+    setNewPinValue('');
+    setToast('PIN aggiornato');
   }
 
   async function removeUser(u: User) {
@@ -1557,19 +2014,32 @@ function AccountsSection({ users }: { users: User[] }) {
 
   return (
     <div className="px-4">
-      <h2 className="mb-1 font-display text-xl font-extrabold">Gestione account</h2>
+      <h2 className="mb-1 font-display text-xl font-extrabold">Gestione Operatori & PIN</h2>
       <p className="mb-4 text-sm text-ink/60">
-        Crea account con solo il nome. Gli operatori inviano ordini, il responsabile li riceve con notifica.
+        Crea gli operatori assegnando nome e PIN a 4 cifre per accedere e inviare gli ordini.
       </p>
 
       <div className="mb-6 space-y-3 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Nome operatore / responsabile"
+          placeholder="Nome operatore"
           maxLength={40}
           className="h-12 w-full rounded-xl bg-paper px-4"
         />
+        <div className="flex items-center gap-2 rounded-xl bg-paper px-4">
+          <KeyRound className="size-4 text-ink/50" />
+          <input
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            maxLength={4}
+            value={pin}
+            onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+            placeholder="PIN 4 cifre (es. 1234)"
+            className="h-12 flex-1 bg-transparent font-display text-lg font-bold tracking-widest outline-none"
+          />
+        </div>
         <div className="flex gap-2">
           {(['operatore', 'responsabile'] as Role[]).map((r) => (
             <button
@@ -1585,10 +2055,10 @@ function AccountsSection({ users }: { users: User[] }) {
         </div>
         <button
           onClick={addUser}
-          disabled={!name.trim()}
+          disabled={!name.trim() || pin.length < 4}
           className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-basil font-semibold text-white disabled:opacity-40"
         >
-          <UserPlus className="size-5" /> Crea account
+          <UserPlus className="size-5" /> Crea operatore
         </button>
       </div>
 
@@ -1596,27 +2066,60 @@ function AccountsSection({ users }: { users: User[] }) {
         {users.map((u) => (
           <li
             key={u.id}
-            className="flex items-center gap-3 rounded-2xl bg-white p-3 shadow-sm ring-1 ring-ink/10"
+            className="rounded-2xl bg-white p-3 shadow-sm ring-1 ring-ink/10"
           >
-            <span className="grid size-10 place-items-center rounded-full bg-basil/15 text-lg font-bold text-basil">
-              {u.name.charAt(0).toUpperCase()}
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="truncate font-semibold">{u.name}</div>
+            <div className="flex items-center gap-3">
+              <span className="grid size-10 place-items-center rounded-full bg-basil/15 text-lg font-bold text-basil">
+                {u.name.charAt(0).toUpperCase()}
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-semibold">{u.name}</div>
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <button onClick={() => toggleRole(u)} className="font-medium text-basil underline">
+                    {u.role === 'responsabile' ? 'Responsabile' : 'Operatore'}
+                  </button>
+                  <span className="text-ink/40">·</span>
+                  <span className="font-mono font-semibold text-ink/70">PIN: {u.pin}</span>
+                  <button
+                    onClick={() => {
+                      setEditingPinId(editingPinId === u.id ? null : u.id);
+                      setNewPinValue(u.pin);
+                    }}
+                    className="text-ink/50 underline"
+                  >
+                    cambia PIN
+                  </button>
+                </div>
+              </div>
               <button
-                onClick={() => toggleRole(u)}
-                className="text-xs font-medium text-basil underline"
+                onClick={() => removeUser(u)}
+                className="grid size-10 place-items-center rounded-xl text-tomato"
+                aria-label={`Elimina ${u.name}`}
               >
-                {u.role === 'responsabile' ? 'Responsabile' : 'Operatore'} · cambia ruolo
+                <Trash2 className="size-5" />
               </button>
             </div>
-            <button
-              onClick={() => removeUser(u)}
-              className="grid size-10 place-items-center rounded-xl text-tomato"
-              aria-label={`Elimina ${u.name}`}
-            >
-              <Trash2 className="size-5" />
-            </button>
+
+            {editingPinId === u.id && (
+              <div className="mt-3 flex gap-2 border-t border-ink/5 pt-3">
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={4}
+                  value={newPinValue}
+                  onChange={(e) => setNewPinValue(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  placeholder="Nuovo PIN"
+                  className="h-10 flex-1 rounded-xl bg-paper px-3 font-mono font-bold tracking-widest"
+                />
+                <button
+                  onClick={() => saveNewPin(u.id)}
+                  disabled={newPinValue.length < 4}
+                  className="h-10 rounded-xl bg-basil px-4 text-sm font-semibold text-white disabled:opacity-40"
+                >
+                  Salva PIN
+                </button>
+              </div>
+            )}
           </li>
         ))}
       </ul>
