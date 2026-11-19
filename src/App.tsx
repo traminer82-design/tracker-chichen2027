@@ -320,7 +320,7 @@ export default function App() {
       {tab === 'ordini' && <OrdersSection currentUser={currentUser} />}
       {tab === 'account' && isResp && <AccountsSection users={users} />}
 
-      {/* Bottom nav unificata: Giacenza, Ordini (con tutta la merce base), Account */}
+      {/* Bottom nav: Giacenza, Ordini (con Merce Base integrata), Account */}
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-ink/10 bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-xl justify-around py-2">
           <NavBtn
@@ -1160,35 +1160,29 @@ function ItemSheet({
   );
 }
 
-/* ─── Sezione Ordini + Merce Base unificata ─────────────── */
+/* ─── Sezione Ordini + Merce Base unificata (grafica originale) ─ */
 type BaseCatalogRow = {
   key: string;
   productId?: string;
   name: string;
   category: Category;
   defaultUnit: OrderUnit;
-  stockQty?: number;
-  stockUnit?: string;
-  low?: boolean;
 };
 
 function OrdersSection({ currentUser }: { currentUser: User }) {
   const isResp = currentUser.role === 'responsabile';
   const [orders, setOrders] = useState<Order[]>([]);
-  const [items, setItems] = useState<Item[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [draftLines, setDraftLines] = useState<Record<string, { qty: number; unit: OrderUnit }>>({});
-  const [search, setSearch] = useState('');
-  const [note, setNote] = useState('');
-  const [filterCat, setFilterCat] = useState<Category | 'tutti'>('tutti');
-  const [filterOperator, setFilterOperator] = useState<string>('tutti');
-  const [submitting, setSubmitting] = useState(false);
-  const [toast, setToast] = useState('');
-
-  // Aggiunta rapido nuovo prodotto alla merce base
   const [newName, setNewName] = useState('');
   const [newCat, setNewCat] = useState<Category>('altro');
   const [newUnit, setNewUnit] = useState<OrderUnit>('kg');
+  const [search, setSearch] = useState('');
+  const [filterCat, setFilterCat] = useState<Category | 'tutti'>('tutti');
+  const [note, setNote] = useState('');
+  const [filterOperator, setFilterOperator] = useState<string>('tutti');
+  const [submitting, setSubmitting] = useState(false);
+  const [toast, setToast] = useState('');
 
   useEffect(() => {
     return onSnapshot(query(ordersCol, orderBy('createdAt', 'desc')), (snap) => {
@@ -1199,25 +1193,6 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
       setOrders(list);
     });
   }, [currentUser.id, isResp]);
-
-  useEffect(() => {
-    return onSnapshot(query(itemsCol, orderBy('name')), (snap) => {
-      setItems(
-        snap.docs.map(
-          (d) =>
-            ({
-              min: 1,
-              unit: 'kg',
-              quantity: 0,
-              category: 'altro',
-              zone: 'cella_congelamento',
-              ...(d.data() as object),
-              id: d.id,
-            }) as Item,
-        ),
-      );
-    });
-  }, []);
 
   useEffect(() => {
     return onSnapshot(query(productsCol, orderBy('name')), (snap) => {
@@ -1238,105 +1213,61 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(''), 3000);
+    const t = setTimeout(() => setToast(''), 2500);
     return () => clearTimeout(t);
   }, [toast]);
 
-  // Elenco unificato di tutta la merce base (prodotti in catalogo + eventuali giacenze)
-  const allBaseProducts = useMemo<BaseCatalogRow[]>(() => {
-    const map = new Map<string, BaseCatalogRow>();
-    products.forEach((p) => {
-      const k = p.name.trim().toLowerCase();
-      map.set(k, {
-        key: k,
+  const baseRows = useMemo<BaseCatalogRow[]>(() => {
+    const q = search.trim().toLowerCase();
+    return products
+      .filter((p) => {
+        if (filterCat !== 'tutti' && p.category !== filterCat) return false;
+        return !q || p.name.toLowerCase().includes(q);
+      })
+      .map((p) => ({
+        key: p.name.trim().toLowerCase(),
         productId: p.id,
         name: p.name,
         category: p.category,
         defaultUnit: normalizeOrderUnit(p.unit),
-      });
-    });
-    items.forEach((i) => {
-      const k = i.name.trim().toLowerCase();
-      const prev = map.get(k);
-      map.set(k, {
-        key: k,
-        productId: prev?.productId,
-        name: i.name,
-        category: i.category || prev?.category || 'altro',
-        defaultUnit: prev?.defaultUnit ?? normalizeOrderUnit(i.unit),
-        stockQty: i.quantity,
-        stockUnit: i.unit,
-        low: isLow(i),
-      });
-    });
-    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name, 'it'));
-  }, [products, items]);
+      }));
+  }, [products, filterCat, search]);
 
-  const filteredBaseProducts = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return allBaseProducts.filter((p) => {
-      if (filterCat !== 'tutti' && p.category !== filterCat) return false;
-      return !q || p.name.toLowerCase().includes(q);
-    });
-  }, [allBaseProducts, filterCat, search]);
-
-  // Aggiunge subito il prodotto alla lista d'ordine con "+"
-  function addToOrderList(row: BaseCatalogRow) {
+  function addPlusToList(row: BaseCatalogRow) {
     setDraftLines((prev) => {
-      const existing = prev[row.key];
-      if (!existing) {
-        return {
-          ...prev,
-          [row.key]: { qty: 1, unit: row.defaultUnit || 'kg' },
-        };
+      const cur = prev[row.key];
+      if (!cur) {
+        return { ...prev, [row.key]: { qty: 1, unit: row.defaultUnit || 'kg' } };
       }
       return {
         ...prev,
-        [row.key]: {
-          qty: Number((existing.qty + 1).toFixed(2)),
-          unit: existing.unit,
-        },
+        [row.key]: { qty: Number((cur.qty + 1).toFixed(2)), unit: cur.unit },
       };
     });
   }
 
-  function updateDraftQty(key: string, qty: number) {
+  function setLineQty(key: string, qty: number) {
     setDraftLines((prev) => {
-      const existing = prev[key];
-      if (!existing) return prev;
+      const cur = prev[key];
+      if (!cur) return prev;
       if (qty <= 0) {
         const next = { ...prev };
         delete next[key];
         return next;
       }
-      return {
-        ...prev,
-        [key]: { ...existing, qty: Number(qty.toFixed(2)) },
-      };
+      return { ...prev, [key]: { ...cur, qty: Number(qty.toFixed(2)) } };
     });
   }
 
-  function updateDraftUnit(key: string, unit: OrderUnit) {
+  function setLineUnit(key: string, unit: OrderUnit) {
     setDraftLines((prev) => {
-      const existing = prev[key];
-      if (!existing) return prev;
-      return {
-        ...prev,
-        [key]: { ...existing, unit },
-      };
+      const cur = prev[key];
+      if (!cur) return prev;
+      return { ...prev, [key]: { ...cur, unit } };
     });
   }
 
-  function removeDraftLine(key: string) {
-    setDraftLines((prev) => {
-      const next = { ...prev };
-      delete next[key];
-      return next;
-    });
-  }
-
-  // Crea un nuovo prodotto nella merce base e lo aggiunge subito alla lista d'ordine
-  async function createBaseAndAdd() {
+  async function addBaseProduct() {
     const n = newName.trim();
     if (!n) return;
     const existing = products.find((p) => p.name.toLowerCase() === n.toLowerCase());
@@ -1362,38 +1293,37 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
     setToast(`"${n}" aggiunto alla lista`);
   }
 
-  async function deleteBaseProduct(row: BaseCatalogRow) {
-    if (!isResp || !row.productId) return;
-    await deleteDoc(doc(db, 'products', row.productId));
-    removeDraftLine(row.key);
-    setToast(`"${row.name}" rimosso dalla merce base`);
+  async function removeBaseProduct(id: string) {
+    if (!isResp) return;
+    await deleteDoc(doc(db, 'products', id));
+    setToast('Prodotto rimosso');
   }
 
-  const compiledEntries = useMemo(() => {
+  const selectedList = useMemo(() => {
     return Object.entries(draftLines)
       .filter(([, v]) => v.qty > 0)
       .map(([key, v]) => {
-        const prod = allBaseProducts.find((p) => p.key === key);
+        const p = products.find((x) => x.name.trim().toLowerCase() === key);
         return {
           productKey: key,
-          name: prod?.name ?? key,
-          category: prod?.category ?? ('altro' as Category),
+          name: p?.name ?? key,
+          category: p?.category ?? ('altro' as Category),
           quantity: v.qty,
           unit: v.unit,
         };
       });
-  }, [draftLines, allBaseProducts]);
+  }, [draftLines, products]);
 
-  async function sendFullListToResponsible() {
-    if (compiledEntries.length === 0 || submitting) return;
+  async function sendOrderList() {
+    if (selectedList.length === 0 || submitting) return;
     setSubmitting(true);
     try {
-      const lines: OrderLine[] = compiledEntries.map((e) => ({
-        productKey: e.productKey,
-        name: e.name,
-        quantity: e.quantity,
-        unit: e.unit,
-        category: e.category,
+      const lines: OrderLine[] = selectedList.map((l) => ({
+        productKey: l.productKey,
+        name: l.name,
+        quantity: l.quantity,
+        unit: l.unit,
+        category: l.category,
       }));
 
       await addDoc(ordersCol, {
@@ -1440,67 +1370,63 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
 
   return (
     <div className="space-y-6 px-4">
-      {/* 1. COMPILAZIONE LISTA DA TUTTA LA MERCE BASE */}
-      <section className="rounded-3xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
-        <div className="mb-3">
+      {/* Merce Base unificata in Ordini con + per aggiungere alla lista */}
+      <section className="space-y-3 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
+        <div>
           <h2 className="font-display text-xl font-extrabold">Merce Base & Lista Ordine</h2>
-          <p className="text-xs text-ink/60">
-            Tocca <strong>+</strong> sul prodotto, imposta quantità e scegli <strong>kg</strong>,{' '}
-            <strong>l</strong>, <strong>cartoni</strong> o <strong>pezzi</strong>, poi invia tutta la
-            lista al responsabile.
+          <p className="text-sm text-ink/60">
+            Aggiungi i prodotti con <strong>+</strong>, imposta quantità e unità (kg, l, cartoni,
+            pezzi) e invia tutta la lista al responsabile.
           </p>
         </div>
 
-        {/* Aggiunta veloce nuovo prodotto nella merce base */}
-        <div className="mb-3 space-y-2 rounded-2xl bg-paper p-3">
-          <div className="flex gap-2">
-            <input
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="Nuovo prodotto base (es. Panna fresca)"
-              maxLength={60}
-              className="h-10 flex-1 rounded-xl bg-white px-3 text-sm outline-none ring-1 ring-ink/10"
-            />
-            <button
-              onClick={createBaseAndAdd}
-              disabled={!newName.trim()}
-              className="flex h-10 shrink-0 items-center gap-1 rounded-xl bg-basil px-3.5 text-sm font-bold text-white disabled:opacity-40"
-            >
-              <Plus className="size-4" /> Aggiungi
-            </button>
+        <div className="flex gap-2">
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="Nuovo prodotto base..."
+            maxLength={60}
+            className="h-11 flex-1 rounded-xl bg-paper px-3 text-sm outline-none"
+          />
+          <button
+            onClick={addBaseProduct}
+            disabled={!newName.trim()}
+            className="flex h-11 shrink-0 items-center gap-1 rounded-xl bg-basil px-4 text-sm font-semibold text-white disabled:opacity-40"
+          >
+            <Plus className="size-4" /> Aggiungi
+          </button>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap gap-1.5">
+            {CATEGORIES.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => setNewCat(c.id)}
+                className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                  newCat === c.id ? 'bg-ink text-white' : 'bg-paper'
+                }`}
+              >
+                {c.emoji} {c.label}
+              </button>
+            ))}
           </div>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap gap-1">
-              {CATEGORIES.map((c) => (
-                <button
-                  key={c.id}
-                  onClick={() => setNewCat(c.id)}
-                  className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
-                    newCat === c.id ? 'bg-ink text-white' : 'bg-white text-ink/70'
-                  }`}
-                >
-                  {c.emoji} {c.label}
-                </button>
-              ))}
-            </div>
-            <div className="flex gap-1">
-              {ORDER_UNITS.map((u) => (
-                <button
-                  key={u}
-                  onClick={() => setNewUnit(u)}
-                  className={`rounded-lg px-2 py-1 text-xs font-bold ${
-                    newUnit === u ? 'bg-basil text-white' : 'bg-white text-ink/70'
-                  }`}
-                >
-                  {u}
-                </button>
-              ))}
-            </div>
+          <div className="flex gap-1">
+            {ORDER_UNITS.map((u) => (
+              <button
+                key={u}
+                onClick={() => setNewUnit(u)}
+                className={`rounded-lg px-2 py-1 text-xs font-semibold ${
+                  newUnit === u ? 'bg-basil text-white' : 'bg-paper'
+                }`}
+              >
+                {u}
+              </button>
+            ))}
           </div>
         </div>
 
-        {/* Ricerca e filtri categoria */}
-        <label className="mb-2 flex h-11 items-center gap-2 rounded-xl bg-paper px-3">
+        <label className="flex h-11 items-center gap-2 rounded-xl bg-paper px-3">
           <Search className="size-4 text-ink/50" />
           <input
             value={search}
@@ -1515,21 +1441,21 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
           )}
         </label>
 
-        <div className="mb-3 flex gap-1.5 overflow-x-auto pb-1">
+        <div className="flex gap-2 overflow-x-auto pb-1">
           <button
             onClick={() => setFilterCat('tutti')}
             className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
-              filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-paper text-ink/70'
+              filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-paper'
             }`}
           >
-            Tutti ({allBaseProducts.length})
+            Tutti
           </button>
           {CATEGORIES.map((c) => (
             <button
               key={c.id}
               onClick={() => setFilterCat(c.id)}
               className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
-                filterCat === c.id ? 'bg-ink text-white' : 'bg-paper text-ink/70'
+                filterCat === c.id ? 'bg-ink text-white' : 'bg-paper'
               }`}
             >
               {c.emoji} {c.label}
@@ -1537,133 +1463,101 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
           ))}
         </div>
 
-        {/* Catalogo merce base con + per aggiungere alla lista */}
-        <div className="max-h-72 space-y-1.5 overflow-y-auto pr-0.5">
-          {filteredBaseProducts.length === 0 ? (
-            <p className="py-8 text-center text-sm text-ink/50">
-              Nessun prodotto trovato. Aggiungilo sopra per inserirlo nella merce base.
-            </p>
-          ) : (
-            filteredBaseProducts.map((row) => {
-              const inList = draftLines[row.key];
-              const cat = CATEGORIES.find((c) => c.id === row.category);
-              return (
-                <div
-                  key={row.key}
-                  className={`flex items-center justify-between gap-2 rounded-2xl p-2.5 ring-1 ${
-                    inList ? 'bg-basil/10 ring-basil/40' : 'bg-paper ring-transparent'
-                  }`}
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <span>{cat?.emoji}</span>
-                      <span className="truncate text-sm font-semibold">{row.name}</span>
-                    </div>
-                    <div className="text-[11px] text-ink/50">
-                      {cat?.label}
-                      {row.stockQty !== undefined
-                        ? ` · Cella: ${row.stockQty} ${row.stockUnit}`
-                        : ''}
-                    </div>
-                  </div>
-
-                  {inList && (
-                    <span className="rounded-full bg-basil px-2.5 py-0.5 text-xs font-bold text-white tabular-nums">
-                      {inList.qty} {inList.unit}
-                    </span>
-                  )}
-
-                  {isResp && row.productId && (
-                    <button
-                      onClick={() => deleteBaseProduct(row)}
-                      aria-label={`Elimina ${row.name} dalla merce base`}
-                      className="grid size-9 place-items-center rounded-xl bg-white text-tomato/80"
-                    >
-                      <Trash2 className="size-4" />
-                    </button>
-                  )}
-
-                  <button
-                    onClick={() => addToOrderList(row)}
-                    aria-label={`Aggiungi ${row.name} alla lista`}
-                    className="grid size-9 shrink-0 place-items-center rounded-xl bg-basil text-white shadow-xs active:scale-95"
-                  >
-                    <Plus className="size-4" />
-                  </button>
-                </div>
-              );
-            })
-          )}
-        </div>
-
-        {/* Lista compilata dall'operatore con quantità e unità (kg / l / cartoni / pezzi) */}
-        {compiledEntries.length > 0 && (
-          <div className="mt-4 space-y-2.5 border-t border-ink/10 pt-4">
-            <div className="flex items-center justify-between">
-              <h3 className="font-display text-base font-extrabold">
-                Lista da inviare ({compiledEntries.length})
-              </h3>
-              <button
-                onClick={() => setDraftLines({})}
-                className="text-xs font-semibold text-tomato underline"
+        <ul className="max-h-64 space-y-2 overflow-y-auto">
+          {baseRows.map((row) => {
+            const cat = CATEGORIES.find((c) => c.id === row.category);
+            const inList = draftLines[row.key];
+            return (
+              <li
+                key={row.key}
+                className="flex items-center justify-between gap-2 rounded-xl bg-paper px-3 py-2"
               >
-                Svuota lista
-              </button>
-            </div>
-
-            <ul className="space-y-2">
-              {compiledEntries.map((line) => (
-                <li
-                  key={line.productKey}
-                  className="rounded-2xl bg-paper p-3 ring-1 ring-ink/10"
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <span>{cat?.emoji}</span>
+                    <span className="truncate text-sm font-semibold">{row.name}</span>
+                  </div>
+                  <div className="text-xs text-ink/50">
+                    {cat?.label} · {row.defaultUnit}
+                  </div>
+                </div>
+                {inList && (
+                  <span className="rounded-full bg-basil/15 px-2.5 py-0.5 text-xs font-bold text-basil tabular-nums">
+                    {inList.qty} {inList.unit}
+                  </span>
+                )}
+                {isResp && row.productId && (
+                  <button
+                    onClick={() => removeBaseProduct(row.productId!)}
+                    className="grid size-8 place-items-center rounded-lg text-tomato"
+                    aria-label={`Elimina ${row.name}`}
+                  >
+                    <Trash2 className="size-4" />
+                  </button>
+                )}
+                <button
+                  onClick={() => addPlusToList(row)}
+                  className="grid size-9 place-items-center rounded-xl bg-basil text-white"
+                  aria-label={`Aggiungi ${row.name} alla lista`}
                 >
+                  <Plus className="size-4" />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+
+        {selectedList.length > 0 && (
+          <div className="space-y-2.5 border-t border-ink/10 pt-3">
+            <h3 className="font-display text-base font-extrabold">
+              Lista da inviare ({selectedList.length})
+            </h3>
+            <ul className="space-y-2">
+              {selectedList.map((line) => (
+                <li key={line.productKey} className="space-y-2 rounded-xl bg-paper p-3">
                   <div className="flex items-center justify-between gap-2">
                     <span className="truncate text-sm font-bold">{line.name}</span>
-                    <div className="flex items-center gap-1">
+                    <div className="flex items-center gap-1.5">
                       <button
-                        onClick={() => updateDraftQty(line.productKey, line.quantity - 1)}
-                        className="grid size-8 place-items-center rounded-lg bg-white"
+                        onClick={() => setLineQty(line.productKey, line.quantity - 1)}
+                        className="grid size-8 place-items-center rounded-lg bg-white ring-1 ring-ink/10"
                       >
                         <Minus className="size-3.5" />
                       </button>
                       <input
                         type="number"
                         inputMode="decimal"
-                        min={0.1}
                         step="0.5"
+                        min={0.1}
                         value={line.quantity}
                         onChange={(e) => {
                           const v = parseFloat(e.target.value);
-                          updateDraftQty(line.productKey, Number.isFinite(v) ? v : 0);
+                          setLineQty(line.productKey, Number.isFinite(v) ? v : 0);
                         }}
-                        className="h-8 w-16 rounded-lg bg-white text-center font-display text-sm font-extrabold tabular-nums outline-none ring-1 ring-ink/10"
+                        className="h-8 w-16 rounded-lg bg-white text-center font-display text-sm font-extrabold tabular-nums ring-1 ring-ink/10"
                       />
                       <button
-                        onClick={() => updateDraftQty(line.productKey, line.quantity + 1)}
-                        className="grid size-8 place-items-center rounded-lg bg-white"
+                        onClick={() => setLineQty(line.productKey, line.quantity + 1)}
+                        className="grid size-8 place-items-center rounded-lg bg-white ring-1 ring-ink/10"
                       >
                         <Plus className="size-3.5" />
                       </button>
                       <button
-                        onClick={() => removeDraftLine(line.productKey)}
-                        aria-label={`Rimuovi ${line.name}`}
+                        onClick={() => setLineQty(line.productKey, 0)}
                         className="grid size-8 place-items-center rounded-lg text-tomato"
+                        aria-label={`Rimuovi ${line.name}`}
                       >
                         <X className="size-4" />
                       </button>
                     </div>
                   </div>
-
-                  {/* Selettore unità di misura: kg / l / cartoni / pezzi */}
-                  <div className="mt-2 grid grid-cols-4 gap-1.5">
+                  <div className="flex gap-1.5">
                     {ORDER_UNITS.map((u) => (
                       <button
                         key={u}
-                        onClick={() => updateDraftUnit(line.productKey, u)}
-                        className={`h-8 rounded-lg text-xs font-bold ${
-                          line.unit === u
-                            ? 'bg-ink text-white'
-                            : 'bg-white text-ink/70 ring-1 ring-ink/10'
+                        onClick={() => setLineUnit(line.productKey, u)}
+                        className={`h-8 flex-1 rounded-lg text-xs font-semibold ${
+                          line.unit === u ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
                         }`}
                       >
                         {u}
@@ -1679,26 +1573,26 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
               onChange={(e) => setNote(e.target.value)}
               placeholder="Note per il responsabile (opzionale)"
               maxLength={120}
-              className="h-11 w-full rounded-xl bg-paper px-3 text-sm outline-none ring-1 ring-ink/10"
+              className="h-11 w-full rounded-xl bg-paper px-3 text-sm outline-none"
             />
 
             <button
-              onClick={sendFullListToResponsible}
+              onClick={sendOrderList}
               disabled={submitting}
-              className="flex h-13 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-base font-bold text-white shadow-md active:scale-[0.99] disabled:opacity-50"
+              className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-base font-semibold text-white disabled:opacity-40"
             >
-              <Send className="size-5" /> Invia lista al responsabile ({compiledEntries.length})
+              <Send className="size-4" /> Invia lista al responsabile ({selectedList.length})
             </button>
           </div>
         )}
       </section>
 
-      {/* 2. STORICO ORDINI RICEVUTI / INVIATI */}
+      {/* Ordini ricevuti / inviati */}
       <section>
         <div className="mb-3 flex items-center justify-between">
           <div>
             <h2 className="font-display text-xl font-extrabold">
-              {isResp ? 'Ordini ricevuti dal team' : 'Le mie liste inviate'}
+              {isResp ? 'Ordini ricevuti' : 'Le mie liste inviate'}
             </h2>
             {isResp && pendingCount > 0 && (
               <p className="text-sm font-semibold text-tomato">{pendingCount} in attesa</p>
@@ -1731,8 +1625,8 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
         )}
 
         {visibleOrders.length === 0 ? (
-          <div className="rounded-2xl bg-white py-10 text-center text-sm text-ink/60 ring-1 ring-ink/10">
-            <ShoppingBasket className="mx-auto mb-2 size-8 text-ink/40" />
+          <div className="py-12 text-center text-ink/60">
+            <ShoppingBasket className="mx-auto mb-3 size-10 text-ink/40" />
             {isResp
               ? 'Nessun ordine ricevuto ancora.'
               : 'Non hai ancora inviato alcuna lista.'}
@@ -1766,7 +1660,7 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
                       <li key={idx} className="flex items-center gap-2 py-1.5 text-sm">
                         <span>{cat?.emoji}</span>
                         <span className="flex-1 font-medium">{l.name}</span>
-                        <span className="rounded-lg bg-paper px-2.5 py-0.5 font-bold tabular-nums">
+                        <span className="font-bold tabular-nums">
                           {l.quantity} {l.unit}
                         </span>
                       </li>
