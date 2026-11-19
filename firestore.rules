@@ -21,13 +21,18 @@ service cloud.firestore {
         && request.resource.data.name.size() <= 60;
     }
 
-    // Account (solo nome + ruolo)
+    // Account (nome + ruolo + PIN)
     match /users/{userId} {
       allow read, write: if true;
     }
 
     // Ordini dagli operatori al responsabile
     match /orders/{orderId} {
+      allow read, write: if true;
+    }
+
+    // Token push FCM per notifiche ad app chiusa
+    match /pushTokens/{userId} {
       allow read, write: if true;
     }
   }
