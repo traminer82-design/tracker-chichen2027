@@ -1,29 +1,62 @@
-importScripts('https://www.gstatic.com/firebasejs/11.0.0/firebase-app-compat.js');
-importScripts('https://www.gstatic.com/firebasejs/11.0.0/firebase-messaging-compat.js');
-
-firebase.initializeApp({
-  projectId: 'gen-lang-client-0210208250',
-  appId: '1:638021087128:web:7290ee4521383914db85ed',
-  apiKey: 'AIzaSyCWjgjHkUKNoWHZyUD4oOZqxblVNLMZoOc',
-  messagingSenderId: '638021087128',
+/* KitchenOS Service Worker - Push anche ad app chiusa */
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
 });
 
-const messaging = firebase.messaging();
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
 
-messaging.onBackgroundMessage((payload) => {
-  const title = payload.notification?.title || 'Nuovo ordine KitchenOS';
-  const body = payload.notification?.body || 'Un operatore ha inviato la lista merce.';
-  self.registration.showNotification(title, {
-    body,
-    icon: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
-    badge: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
-    vibrate: [300, 100, 300, 100, 400],
-    requireInteraction: true,
-    tag: 'kitchenos-order',
-  });
+self.addEventListener('push', (event) => {
+  let data = {
+    title: 'Nuovo ordine KitchenOS',
+    body: 'Un operatore ha inviato una lista ordini.',
+    url: '/',
+  };
+
+  if (event.data) {
+    try {
+      const parsed = event.data.json();
+      const notif = parsed.notification || parsed;
+      data = {
+        title: notif.title || data.title,
+        body: notif.body || data.body,
+        url: parsed.data?.url || notif.click_action || '/',
+      };
+    } catch {
+      const txt = event.data.text();
+      if (txt) data.body = txt;
+    }
+  }
+
+  event.waitUntil(
+    self.registration.showNotification(data.title, {
+      body: data.body,
+      icon: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
+      badge: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
+      vibrate: [350, 120, 350, 120, 500],
+      requireInteraction: true,
+      tag: 'kitchenos-order-' + Date.now(),
+      data: { url: data.url },
+    }),
+  );
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  event.waitUntil(clients.openWindow('/'));
+  const targetUrl = event.notification.data?.url || '/';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if ('focus' in client) {
+          client.navigate(targetUrl);
+          return client.focus();
+        }
+      }
+      if (self.clients.openWindow) {
+        return self.clients.openWindow(targetUrl);
+      }
+      return undefined;
+    }),
+  );
 });
