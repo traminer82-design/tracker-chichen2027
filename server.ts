@@ -2,11 +2,12 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import path from 'path';
+import notifyOrderHandler from './api/notify-order.js';
 
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: '5kb' }));
+app.use(express.json({ limit: '16kb' }));
 
 const transporter = nodemailer.createTransport({
   service: 'gmail',
@@ -42,6 +43,10 @@ app.post('/api/send-alert', async (req, res) => {
     console.error('Errore invio email:', error);
     res.status(500).send('Errore invio email');
   }
+});
+
+app.post('/api/notify-order', async (req, res) => {
+  await notifyOrderHandler(req, res);
 });
 
 async function start() {
