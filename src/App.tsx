@@ -13,7 +13,6 @@ import {
   updateDoc,
 } from 'firebase/firestore';
 import {
-  BookOpen,
   Check,
   ChefHat,
   KeyRound,
@@ -39,6 +38,7 @@ import { db } from './firebase';
 type Role = 'operatore' | 'responsabile';
 type Category = 'carne' | 'pesce' | 'verdure' | 'latticini' | 'pasticceria' | 'altro';
 type StorageZone = 'cella_congelamento' | 'magazzino';
+type OrderUnit = 'kg' | 'l' | 'cartoni' | 'pezzi';
 
 type User = { id: string; name: string; role: Role; pin: string };
 type Product = {
@@ -68,7 +68,6 @@ type Draft = {
   zone: StorageZone;
   productId?: string;
 };
-type OrderUnit = 'kg' | 'cartoni';
 type OrderLine = {
   productKey: string;
   name: string;
@@ -86,8 +85,8 @@ type Order = {
   createdAt?: { seconds: number };
 };
 
-const STOCK_UNITS = ['kg', 'cartoni', 'pz', 'l', 'conf.'];
-const ORDER_UNITS: OrderUnit[] = ['kg', 'cartoni'];
+const STOCK_UNITS = ['kg', 'l', 'cartoni', 'pezzi', 'conf.'];
+const ORDER_UNITS: OrderUnit[] = ['kg', 'l', 'cartoni', 'pezzi'];
 
 const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
   { id: 'carne', label: 'Carne', emoji: '🥩' },
@@ -105,6 +104,15 @@ const productsCol = collection(db, 'products');
 
 const isLow = (i: Item) => i.quantity <= i.min;
 const STORAGE_KEY = 'kitchenos-user-id';
+
+function normalizeOrderUnit(u?: string): OrderUnit {
+  if (!u) return 'kg';
+  const low = u.toLowerCase().trim();
+  if (low === 'l' || low === 'lt' || low === 'litri') return 'l';
+  if (low === 'cartoni' || low === 'cartone' || low === 'ct' || low === 'crt') return 'cartoni';
+  if (low === 'pezzi' || low === 'pz' || low === 'pezzo') return 'pezzi';
+  return 'kg';
+}
 
 /* ─── Suono notifica (doppio squillo ad alto volume) ──── */
 function playNotifySound() {
@@ -175,12 +183,11 @@ export default function App() {
   const [users, setUsers] = useState<User[]>([]);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [booting, setBooting] = useState(true);
-  const [tab, setTab] = useState<'giacenza' | 'ordini' | 'catalogo' | 'account'>('giacenza');
+  const [tab, setTab] = useState<'giacenza' | 'ordini' | 'account'>('giacenza');
   const [pendingOrdersCount, setPendingOrdersCount] = useState(0);
   const knownOrderIds = useRef<Set<string>>(new Set());
   const initialOrdersLoaded = useRef(false);
 
-  // Carica utenti e ripristina sessione
   useEffect(() => {
     const unsub = onSnapshot(query(usersCol, orderBy('name')), (snap) => {
       const list = snap.docs.map((d) => ({
@@ -200,7 +207,6 @@ export default function App() {
     return unsub;
   }, []);
 
-  // Listener globale sugli ordini per il responsabile (attivo su qualsiasi tab)
   useEffect(() => {
     if (!currentUser || currentUser.role !== 'responsabile') {
       setPendingOrdersCount(0);
@@ -312,10 +318,9 @@ export default function App() {
 
       {tab === 'giacenza' && <InventorySection currentUser={currentUser} />}
       {tab === 'ordini' && <OrdersSection currentUser={currentUser} />}
-      {tab === 'catalogo' && <CatalogSection currentUser={currentUser} />}
       {tab === 'account' && isResp && <AccountsSection users={users} />}
 
-      {/* Bottom nav */}
+      {/* Bottom nav unificata: Giacenza, Ordini (con tutta la merce base), Account */}
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-ink/10 bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-xl justify-around py-2">
           <NavBtn
@@ -330,12 +335,6 @@ export default function App() {
             icon={<ShoppingBasket className="size-5" />}
             label="Ordini"
             badge={isResp ? pendingOrdersCount : 0}
-          />
-          <NavBtn
-            active={tab === 'catalogo'}
-            onClick={() => setTab('catalogo')}
-            icon={<BookOpen className="size-5" />}
-            label="Merce Base"
           />
           {isResp && (
             <NavBtn
@@ -367,7 +366,7 @@ function NavBtn({
   return (
     <button
       onClick={onClick}
-      className={`relative flex flex-col items-center gap-0.5 px-4 py-1 text-xs font-semibold ${
+      className={`relative flex flex-col items-center gap-0.5 px-5 py-1 text-xs font-semibold ${
         active ? 'text-basil' : 'text-ink/50'
       }`}
     >
@@ -1055,7 +1054,7 @@ function ItemSheet({
           autoFocus={!draft.id && !draft.name}
           value={draft.name}
           onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-          placeholder="Nome (es. Petto di pollo, Patate)"
+          placeholder="Nome (es. Petto di pollo, Latte)"
           maxLength={60}
           className="h-12 w-full rounded-xl bg-paper px-4 text-base"
         />
@@ -1103,7 +1102,7 @@ function ItemSheet({
           onChange={(n) => setDraft({ ...draft, quantity: n })}
         />
 
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           {STOCK_UNITS.map((u) => (
             <button
               key={u}
@@ -1161,28 +1160,35 @@ function ItemSheet({
   );
 }
 
-/* ─── Sezione Ordini (tutta la merce base in kg o cartoni) */
+/* ─── Sezione Ordini + Merce Base unificata ─────────────── */
 type BaseCatalogRow = {
   key: string;
+  productId?: string;
   name: string;
   category: Category;
+  defaultUnit: OrderUnit;
   stockQty?: number;
   stockUnit?: string;
   low?: boolean;
 };
 
 function OrdersSection({ currentUser }: { currentUser: User }) {
+  const isResp = currentUser.role === 'responsabile';
   const [orders, setOrders] = useState<Order[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
-  const [showNew, setShowNew] = useState(false);
   const [draftLines, setDraftLines] = useState<Record<string, { qty: number; unit: OrderUnit }>>({});
-  const [orderSearch, setOrderSearch] = useState('');
+  const [search, setSearch] = useState('');
   const [note, setNote] = useState('');
   const [filterCat, setFilterCat] = useState<Category | 'tutti'>('tutti');
   const [filterOperator, setFilterOperator] = useState<string>('tutti');
+  const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState('');
-  const isResp = currentUser.role === 'responsabile';
+
+  // Aggiunta rapido nuovo prodotto alla merce base
+  const [newName, setNewName] = useState('');
+  const [newCat, setNewCat] = useState<Category>('altro');
+  const [newUnit, setNewUnit] = useState<OrderUnit>('kg');
 
   useEffect(() => {
     return onSnapshot(query(ordersCol, orderBy('createdAt', 'desc')), (snap) => {
@@ -1236,14 +1242,17 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
     return () => clearTimeout(t);
   }, [toast]);
 
+  // Elenco unificato di tutta la merce base (prodotti in catalogo + eventuali giacenze)
   const allBaseProducts = useMemo<BaseCatalogRow[]>(() => {
     const map = new Map<string, BaseCatalogRow>();
     products.forEach((p) => {
       const k = p.name.trim().toLowerCase();
       map.set(k, {
         key: k,
+        productId: p.id,
         name: p.name,
         category: p.category,
+        defaultUnit: normalizeOrderUnit(p.unit),
       });
     });
     items.forEach((i) => {
@@ -1251,8 +1260,10 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
       const prev = map.get(k);
       map.set(k, {
         key: k,
+        productId: prev?.productId,
         name: i.name,
         category: i.category || prev?.category || 'altro',
+        defaultUnit: prev?.defaultUnit ?? normalizeOrderUnit(i.unit),
         stockQty: i.quantity,
         stockUnit: i.unit,
         low: isLow(i),
@@ -1262,75 +1273,153 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
   }, [products, items]);
 
   const filteredBaseProducts = useMemo(() => {
-    const q = orderSearch.trim().toLowerCase();
+    const q = search.trim().toLowerCase();
     return allBaseProducts.filter((p) => {
       if (filterCat !== 'tutti' && p.category !== filterCat) return false;
       return !q || p.name.toLowerCase().includes(q);
     });
-  }, [allBaseProducts, filterCat, orderSearch]);
+  }, [allBaseProducts, filterCat, search]);
 
-  function setLineQty(row: BaseCatalogRow, qty: number, unit?: OrderUnit) {
-    setDraftLines((prev) => {
-      const next = { ...prev };
-      const currentUnit = unit ?? prev[row.key]?.unit ?? 'kg';
-      if (qty <= 0) {
-        delete next[row.key];
-      } else {
-        next[row.key] = { qty: Number(qty.toFixed(2)), unit: currentUnit };
-      }
-      return next;
-    });
-  }
-
-  function setLineUnit(row: BaseCatalogRow, unit: OrderUnit) {
+  // Aggiunge subito il prodotto alla lista d'ordine con "+"
+  function addToOrderList(row: BaseCatalogRow) {
     setDraftLines((prev) => {
       const existing = prev[row.key];
+      if (!existing) {
+        return {
+          ...prev,
+          [row.key]: { qty: 1, unit: row.defaultUnit || 'kg' },
+        };
+      }
       return {
         ...prev,
-        [row.key]: { qty: existing ? existing.qty : 1, unit },
+        [row.key]: {
+          qty: Number((existing.qty + 1).toFixed(2)),
+          unit: existing.unit,
+        },
       };
     });
   }
 
-  async function submitOrder() {
-    const lines: OrderLine[] = Object.entries(draftLines)
+  function updateDraftQty(key: string, qty: number) {
+    setDraftLines((prev) => {
+      const existing = prev[key];
+      if (!existing) return prev;
+      if (qty <= 0) {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return {
+        ...prev,
+        [key]: { ...existing, qty: Number(qty.toFixed(2)) },
+      };
+    });
+  }
+
+  function updateDraftUnit(key: string, unit: OrderUnit) {
+    setDraftLines((prev) => {
+      const existing = prev[key];
+      if (!existing) return prev;
+      return {
+        ...prev,
+        [key]: { ...existing, unit },
+      };
+    });
+  }
+
+  function removeDraftLine(key: string) {
+    setDraftLines((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }
+
+  // Crea un nuovo prodotto nella merce base e lo aggiunge subito alla lista d'ordine
+  async function createBaseAndAdd() {
+    const n = newName.trim();
+    if (!n) return;
+    const existing = products.find((p) => p.name.toLowerCase() === n.toLowerCase());
+    if (!existing) {
+      await addDoc(productsCol, {
+        name: n,
+        category: newCat,
+        unit: newUnit,
+        defaultMin: 1,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+    const key = n.toLowerCase();
+    setDraftLines((prev) => ({
+      ...prev,
+      [key]: {
+        qty: prev[key]?.qty ? Number((prev[key].qty + 1).toFixed(2)) : 1,
+        unit: prev[key]?.unit ?? newUnit,
+      },
+    }));
+    setNewName('');
+    setToast(`"${n}" aggiunto alla lista`);
+  }
+
+  async function deleteBaseProduct(row: BaseCatalogRow) {
+    if (!isResp || !row.productId) return;
+    await deleteDoc(doc(db, 'products', row.productId));
+    removeDraftLine(row.key);
+    setToast(`"${row.name}" rimosso dalla merce base`);
+  }
+
+  const compiledEntries = useMemo(() => {
+    return Object.entries(draftLines)
       .filter(([, v]) => v.qty > 0)
       .map(([key, v]) => {
-        const prod = allBaseProducts.find((p) => p.key === key)!;
+        const prod = allBaseProducts.find((p) => p.key === key);
         return {
           productKey: key,
-          name: prod.name,
+          name: prod?.name ?? key,
+          category: prod?.category ?? ('altro' as Category),
           quantity: v.qty,
           unit: v.unit,
-          category: prod.category,
         };
       });
+  }, [draftLines, allBaseProducts]);
 
-    if (lines.length === 0) return;
+  async function sendFullListToResponsible() {
+    if (compiledEntries.length === 0 || submitting) return;
+    setSubmitting(true);
+    try {
+      const lines: OrderLine[] = compiledEntries.map((e) => ({
+        productKey: e.productKey,
+        name: e.name,
+        quantity: e.quantity,
+        unit: e.unit,
+        category: e.category,
+      }));
 
-    await addDoc(ordersCol, {
-      operatorId: currentUser.id,
-      operatorName: currentUser.name,
-      lines,
-      note: note.trim(),
-      status: 'pending',
-      createdAt: serverTimestamp(),
-    });
-
-    fetch('/api/notify-order', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      await addDoc(ordersCol, {
+        operatorId: currentUser.id,
         operatorName: currentUser.name,
         lines,
-      }),
-    }).catch(() => {});
+        note: note.trim(),
+        status: 'pending',
+        createdAt: serverTimestamp(),
+      });
 
-    setDraftLines({});
-    setNote('');
-    setOrderSearch('');
-    setShowNew(false);
-    setToast('Lista inviata al Responsabile');
+      fetch('/api/notify-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          operatorName: currentUser.name,
+          lines,
+        }),
+      }).catch(() => {});
+
+      setDraftLines({});
+      setNote('');
+      setToast('Lista inviata al Responsabile');
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   async function setStatus(id: string, status: Order['status']) {
@@ -1348,276 +1437,364 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
   }, [orders, isResp, filterOperator]);
 
   const pendingCount = orders.filter((o) => o.status === 'pending').length;
-  const compiledCount = Object.keys(draftLines).length;
 
   return (
-    <div className="px-4">
-      <div className="mb-4 flex items-center justify-between">
-        <div>
-          <h2 className="font-display text-xl font-extrabold">
-            {isResp ? 'Ordini da tutti gli operatori' : 'Ordini cucina'}
-          </h2>
-          {isResp && pendingCount > 0 && (
-            <p className="text-sm font-semibold text-tomato">{pendingCount} da gestire</p>
-          )}
+    <div className="space-y-6 px-4">
+      {/* 1. COMPILAZIONE LISTA DA TUTTA LA MERCE BASE */}
+      <section className="rounded-3xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
+        <div className="mb-3">
+          <h2 className="font-display text-xl font-extrabold">Merce Base & Lista Ordine</h2>
+          <p className="text-xs text-ink/60">
+            Tocca <strong>+</strong> sul prodotto, imposta quantità e scegli <strong>kg</strong>,{' '}
+            <strong>l</strong>, <strong>cartoni</strong> o <strong>pezzi</strong>, poi invia tutta la
+            lista al responsabile.
+          </p>
         </div>
-        <button
-          onClick={() => setShowNew(true)}
-          className="flex h-11 items-center gap-2 rounded-full bg-basil px-4 text-sm font-semibold text-white shadow-sm"
-        >
-          <Plus className="size-4" /> Compila lista
-        </button>
-      </div>
 
-      {isResp && operatorsInOrders.length > 0 && (
-        <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
+        {/* Aggiunta veloce nuovo prodotto nella merce base */}
+        <div className="mb-3 space-y-2 rounded-2xl bg-paper p-3">
+          <div className="flex gap-2">
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="Nuovo prodotto base (es. Panna fresca)"
+              maxLength={60}
+              className="h-10 flex-1 rounded-xl bg-white px-3 text-sm outline-none ring-1 ring-ink/10"
+            />
+            <button
+              onClick={createBaseAndAdd}
+              disabled={!newName.trim()}
+              className="flex h-10 shrink-0 items-center gap-1 rounded-xl bg-basil px-3.5 text-sm font-bold text-white disabled:opacity-40"
+            >
+              <Plus className="size-4" /> Aggiungi
+            </button>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-1">
+              {CATEGORIES.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => setNewCat(c.id)}
+                  className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                    newCat === c.id ? 'bg-ink text-white' : 'bg-white text-ink/70'
+                  }`}
+                >
+                  {c.emoji} {c.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-1">
+              {ORDER_UNITS.map((u) => (
+                <button
+                  key={u}
+                  onClick={() => setNewUnit(u)}
+                  className={`rounded-lg px-2 py-1 text-xs font-bold ${
+                    newUnit === u ? 'bg-basil text-white' : 'bg-white text-ink/70'
+                  }`}
+                >
+                  {u}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Ricerca e filtri categoria */}
+        <label className="mb-2 flex h-11 items-center gap-2 rounded-xl bg-paper px-3">
+          <Search className="size-4 text-ink/50" />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Cerca nella merce base..."
+            className="h-full flex-1 bg-transparent text-sm outline-none"
+          />
+          {search && (
+            <button onClick={() => setSearch('')}>
+              <X className="size-4 text-ink/50" />
+            </button>
+          )}
+        </label>
+
+        <div className="mb-3 flex gap-1.5 overflow-x-auto pb-1">
           <button
-            onClick={() => setFilterOperator('tutti')}
-            className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ${
-              filterOperator === 'tutti' ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+            onClick={() => setFilterCat('tutti')}
+            className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
+              filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-paper text-ink/70'
             }`}
           >
-            Tutti ({orders.length})
+            Tutti ({allBaseProducts.length})
           </button>
-          {operatorsInOrders.map((op) => (
+          {CATEGORIES.map((c) => (
             <button
-              key={op}
-              onClick={() => setFilterOperator(op)}
-              className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ${
-                filterOperator === op ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+              key={c.id}
+              onClick={() => setFilterCat(c.id)}
+              className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
+                filterCat === c.id ? 'bg-ink text-white' : 'bg-paper text-ink/70'
               }`}
             >
-              {op}
+              {c.emoji} {c.label}
             </button>
           ))}
         </div>
-      )}
 
-      {visibleOrders.length === 0 ? (
-        <div className="py-16 text-center text-ink/60">
-          <ShoppingBasket className="mx-auto mb-3 size-10" />
-          {isResp
-            ? 'Nessun ordine ricevuto ancora.'
-            : 'Tocca "Compila lista" per inserire i quantitativi in kg o cartoni.'}
-        </div>
-      ) : (
-        <ul className="space-y-3">
-          {visibleOrders.map((o) => (
-            <li key={o.id} className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
-              <div className="mb-2 flex items-start justify-between gap-2">
-                <div>
-                  <div className="text-base font-bold">
-                    {isResp ? `Operatore: ${o.operatorName}` : 'Lista inviata'}
-                  </div>
-                  <div className="text-xs text-ink/50">
-                    {o.createdAt
-                      ? new Date(o.createdAt.seconds * 1000).toLocaleString('it-IT', {
-                          day: '2-digit',
-                          month: 'short',
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })
-                      : 'Invio in corso…'}
-                  </div>
-                </div>
-                <StatusBadge status={o.status} />
-              </div>
-              <ul className="mb-2 divide-y divide-ink/5">
-                {o.lines.map((l, idx) => {
-                  const cat = CATEGORIES.find((c) => c.id === l.category);
-                  return (
-                    <li key={idx} className="flex items-center gap-2 py-1.5 text-sm">
+        {/* Catalogo merce base con + per aggiungere alla lista */}
+        <div className="max-h-72 space-y-1.5 overflow-y-auto pr-0.5">
+          {filteredBaseProducts.length === 0 ? (
+            <p className="py-8 text-center text-sm text-ink/50">
+              Nessun prodotto trovato. Aggiungilo sopra per inserirlo nella merce base.
+            </p>
+          ) : (
+            filteredBaseProducts.map((row) => {
+              const inList = draftLines[row.key];
+              const cat = CATEGORIES.find((c) => c.id === row.category);
+              return (
+                <div
+                  key={row.key}
+                  className={`flex items-center justify-between gap-2 rounded-2xl p-2.5 ring-1 ${
+                    inList ? 'bg-basil/10 ring-basil/40' : 'bg-paper ring-transparent'
+                  }`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
                       <span>{cat?.emoji}</span>
-                      <span className="flex-1 font-medium">{l.name}</span>
-                      <span className="rounded-lg bg-paper px-2.5 py-0.5 font-bold tabular-nums">
-                        {l.quantity} {l.unit}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
-              {o.note && <p className="mb-2 text-sm italic text-ink/60">&ldquo;{o.note}&rdquo;</p>}
-              {isResp && o.status === 'pending' && (
-                <button
-                  onClick={() => setStatus(o.id, 'received')}
-                  className="mt-2 flex h-10 w-full items-center justify-center gap-1 rounded-xl bg-basil text-sm font-semibold text-white"
-                >
-                  <Check className="size-4" /> Preso in carico
-                </button>
-              )}
-              {isResp && o.status === 'received' && (
-                <button
-                  onClick={() => setStatus(o.id, 'done')}
-                  className="mt-2 flex h-10 w-full items-center justify-center gap-1 rounded-xl bg-ink text-sm font-semibold text-white"
-                >
-                  <Check className="size-4" /> Segna completato
-                </button>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
+                      <span className="truncate text-sm font-semibold">{row.name}</span>
+                    </div>
+                    <div className="text-[11px] text-ink/50">
+                      {cat?.label}
+                      {row.stockQty !== undefined
+                        ? ` · Cella: ${row.stockQty} ${row.stockUnit}`
+                        : ''}
+                    </div>
+                  </div>
 
-      {showNew && (
-        <div className="fixed inset-0 z-40 flex items-end bg-ink/40" onClick={() => setShowNew(false)}>
-          <div
-            className="mx-auto flex h-[90dvh] w-full max-w-xl flex-col rounded-t-3xl bg-white"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-ink/10 p-4">
-              <div>
-                <h2 className="font-display text-xl font-extrabold">Lista merce cucina</h2>
-                <p className="text-xs text-ink/50">Inserisci i quantitativi in kg o cartoni</p>
-              </div>
-              <button onClick={() => setShowNew(false)}>
-                <X className="size-6" />
+                  {inList && (
+                    <span className="rounded-full bg-basil px-2.5 py-0.5 text-xs font-bold text-white tabular-nums">
+                      {inList.qty} {inList.unit}
+                    </span>
+                  )}
+
+                  {isResp && row.productId && (
+                    <button
+                      onClick={() => deleteBaseProduct(row)}
+                      aria-label={`Elimina ${row.name} dalla merce base`}
+                      className="grid size-9 place-items-center rounded-xl bg-white text-tomato/80"
+                    >
+                      <Trash2 className="size-4" />
+                    </button>
+                  )}
+
+                  <button
+                    onClick={() => addToOrderList(row)}
+                    aria-label={`Aggiungi ${row.name} alla lista`}
+                    className="grid size-9 shrink-0 place-items-center rounded-xl bg-basil text-white shadow-xs active:scale-95"
+                  >
+                    <Plus className="size-4" />
+                  </button>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Lista compilata dall'operatore con quantità e unità (kg / l / cartoni / pezzi) */}
+        {compiledEntries.length > 0 && (
+          <div className="mt-4 space-y-2.5 border-t border-ink/10 pt-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-display text-base font-extrabold">
+                Lista da inviare ({compiledEntries.length})
+              </h3>
+              <button
+                onClick={() => setDraftLines({})}
+                className="text-xs font-semibold text-tomato underline"
+              >
+                Svuota lista
               </button>
             </div>
 
-            <div className="space-y-2 px-4 pt-3">
-              <label className="flex h-11 items-center gap-2 rounded-xl bg-paper px-3">
-                <Search className="size-4 text-ink/50" />
-                <input
-                  value={orderSearch}
-                  onChange={(e) => setOrderSearch(e.target.value)}
-                  placeholder="Cerca prodotto nella merce base..."
-                  className="h-full flex-1 bg-transparent text-sm outline-none"
-                />
-                {orderSearch && (
-                  <button onClick={() => setOrderSearch('')}>
-                    <X className="size-4 text-ink/50" />
-                  </button>
-                )}
-              </label>
-
-              <div className="flex gap-2 overflow-x-auto pb-1">
-                <button
-                  onClick={() => setFilterCat('tutti')}
-                  className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
-                    filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-paper'
-                  }`}
+            <ul className="space-y-2">
+              {compiledEntries.map((line) => (
+                <li
+                  key={line.productKey}
+                  className="rounded-2xl bg-paper p-3 ring-1 ring-ink/10"
                 >
-                  Tutti ({allBaseProducts.length})
-                </button>
-                {CATEGORIES.map((c) => (
-                  <button
-                    key={c.id}
-                    onClick={() => setFilterCat(c.id)}
-                    className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
-                      filterCat === c.id ? 'bg-ink text-white' : 'bg-paper'
-                    }`}
-                  >
-                    {c.emoji} {c.label}
-                  </button>
-                ))}
-              </div>
-            </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-sm font-bold">{line.name}</span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => updateDraftQty(line.productKey, line.quantity - 1)}
+                        className="grid size-8 place-items-center rounded-lg bg-white"
+                      >
+                        <Minus className="size-3.5" />
+                      </button>
+                      <input
+                        type="number"
+                        inputMode="decimal"
+                        min={0.1}
+                        step="0.5"
+                        value={line.quantity}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          updateDraftQty(line.productKey, Number.isFinite(v) ? v : 0);
+                        }}
+                        className="h-8 w-16 rounded-lg bg-white text-center font-display text-sm font-extrabold tabular-nums outline-none ring-1 ring-ink/10"
+                      />
+                      <button
+                        onClick={() => updateDraftQty(line.productKey, line.quantity + 1)}
+                        className="grid size-8 place-items-center rounded-lg bg-white"
+                      >
+                        <Plus className="size-3.5" />
+                      </button>
+                      <button
+                        onClick={() => removeDraftLine(line.productKey)}
+                        aria-label={`Rimuovi ${line.name}`}
+                        className="grid size-8 place-items-center rounded-lg text-tomato"
+                      >
+                        <X className="size-4" />
+                      </button>
+                    </div>
+                  </div>
 
-            <div className="flex-1 overflow-y-auto px-4 py-2">
-              {filteredBaseProducts.length === 0 ? (
-                <p className="py-10 text-center text-sm text-ink/50">
-                  Nessun prodotto trovato. Aggiungi prima i prodotti base in &quot;Merce Base&quot;.
-                </p>
-              ) : (
-                <ul className="space-y-2">
-                  {filteredBaseProducts.map((row) => {
-                    const entry = draftLines[row.key];
-                    const qty = entry?.qty ?? 0;
-                    const unit: OrderUnit = entry?.unit ?? 'kg';
-                    const cat = CATEGORIES.find((c) => c.id === row.category);
-                    return (
-                      <li
-                        key={row.key}
-                        className={`rounded-2xl p-3 ring-1 transition-colors ${
-                          qty > 0 ? 'bg-basil/10 ring-basil/40' : 'bg-paper ring-transparent'
+                  {/* Selettore unità di misura: kg / l / cartoni / pezzi */}
+                  <div className="mt-2 grid grid-cols-4 gap-1.5">
+                    {ORDER_UNITS.map((u) => (
+                      <button
+                        key={u}
+                        onClick={() => updateDraftUnit(line.productKey, u)}
+                        className={`h-8 rounded-lg text-xs font-bold ${
+                          line.unit === u
+                            ? 'bg-ink text-white'
+                            : 'bg-white text-ink/70 ring-1 ring-ink/10'
                         }`}
                       >
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-1.5">
-                              <span>{cat?.emoji}</span>
-                              <span className="truncate font-semibold">{row.name}</span>
-                            </div>
-                            {row.stockQty !== undefined && (
-                              <div className="text-xs text-ink/50">
-                                Giacenza: {row.stockQty} {row.stockUnit}
-                                {row.low && (
-                                  <span className="ml-1 font-semibold text-tomato">· sotto scorta</span>
-                                )}
-                              </div>
-                            )}
-                          </div>
+                        {u}
+                      </button>
+                    ))}
+                  </div>
+                </li>
+              ))}
+            </ul>
 
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              onClick={() => setLineQty(row, Math.max(0, qty - 1), unit)}
-                              className="grid size-9 place-items-center rounded-xl bg-white shadow-xs"
-                            >
-                              <Minus className="size-4" />
-                            </button>
-                            <input
-                              type="number"
-                              inputMode="decimal"
-                              min={0}
-                              step="0.5"
-                              value={qty === 0 ? '' : qty}
-                              placeholder="0"
-                              onChange={(e) => {
-                                const val = parseFloat(e.target.value);
-                                setLineQty(row, Number.isFinite(val) ? val : 0, unit);
-                              }}
-                              className="h-9 w-14 rounded-xl bg-white text-center font-display text-base font-extrabold tabular-nums outline-none ring-1 ring-ink/10"
-                            />
-                            <button
-                              onClick={() => setLineQty(row, qty + 1, unit)}
-                              className="grid size-9 place-items-center rounded-xl bg-white shadow-xs"
-                            >
-                              <Plus className="size-4" />
-                            </button>
-                          </div>
-                        </div>
+            <input
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="Note per il responsabile (opzionale)"
+              maxLength={120}
+              className="h-11 w-full rounded-xl bg-paper px-3 text-sm outline-none ring-1 ring-ink/10"
+            />
 
-                        <div className="mt-2 flex justify-end gap-1.5">
-                          {ORDER_UNITS.map((u) => (
-                            <button
-                              key={u}
-                              onClick={() => setLineUnit(row, u)}
-                              className={`rounded-lg px-3 py-1 text-xs font-bold ${
-                                unit === u
-                                  ? 'bg-ink text-white'
-                                  : 'bg-white text-ink/70 ring-1 ring-ink/10'
-                              }`}
-                            >
-                              {u}
-                            </button>
-                          ))}
-                        </div>
+            <button
+              onClick={sendFullListToResponsible}
+              disabled={submitting}
+              className="flex h-13 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-base font-bold text-white shadow-md active:scale-[0.99] disabled:opacity-50"
+            >
+              <Send className="size-5" /> Invia lista al responsabile ({compiledEntries.length})
+            </button>
+          </div>
+        )}
+      </section>
+
+      {/* 2. STORICO ORDINI RICEVUTI / INVIATI */}
+      <section>
+        <div className="mb-3 flex items-center justify-between">
+          <div>
+            <h2 className="font-display text-xl font-extrabold">
+              {isResp ? 'Ordini ricevuti dal team' : 'Le mie liste inviate'}
+            </h2>
+            {isResp && pendingCount > 0 && (
+              <p className="text-sm font-semibold text-tomato">{pendingCount} in attesa</p>
+            )}
+          </div>
+        </div>
+
+        {isResp && operatorsInOrders.length > 0 && (
+          <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
+            <button
+              onClick={() => setFilterOperator('tutti')}
+              className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ${
+                filterOperator === 'tutti' ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+              }`}
+            >
+              Tutti ({orders.length})
+            </button>
+            {operatorsInOrders.map((op) => (
+              <button
+                key={op}
+                onClick={() => setFilterOperator(op)}
+                className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ${
+                  filterOperator === op ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+                }`}
+              >
+                {op}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {visibleOrders.length === 0 ? (
+          <div className="rounded-2xl bg-white py-10 text-center text-sm text-ink/60 ring-1 ring-ink/10">
+            <ShoppingBasket className="mx-auto mb-2 size-8 text-ink/40" />
+            {isResp
+              ? 'Nessun ordine ricevuto ancora.'
+              : 'Non hai ancora inviato alcuna lista.'}
+          </div>
+        ) : (
+          <ul className="space-y-3">
+            {visibleOrders.map((o) => (
+              <li key={o.id} className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
+                <div className="mb-2 flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-base font-bold">
+                      {isResp ? `Operatore: ${o.operatorName}` : 'Lista inviata'}
+                    </div>
+                    <div className="text-xs text-ink/50">
+                      {o.createdAt
+                        ? new Date(o.createdAt.seconds * 1000).toLocaleString('it-IT', {
+                            day: '2-digit',
+                            month: 'short',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })
+                        : 'Invio in corso…'}
+                    </div>
+                  </div>
+                  <StatusBadge status={o.status} />
+                </div>
+                <ul className="mb-2 divide-y divide-ink/5">
+                  {o.lines.map((l, idx) => {
+                    const cat = CATEGORIES.find((c) => c.id === l.category);
+                    return (
+                      <li key={idx} className="flex items-center gap-2 py-1.5 text-sm">
+                        <span>{cat?.emoji}</span>
+                        <span className="flex-1 font-medium">{l.name}</span>
+                        <span className="rounded-lg bg-paper px-2.5 py-0.5 font-bold tabular-nums">
+                          {l.quantity} {l.unit}
+                        </span>
                       </li>
                     );
                   })}
                 </ul>
-              )}
-            </div>
-
-            <div className="space-y-3 border-t border-ink/10 bg-white p-4">
-              <input
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                placeholder="Note aggiuntive per il responsabile (opzionale)"
-                maxLength={120}
-                className="h-11 w-full rounded-xl bg-paper px-3 text-sm"
-              />
-              <button
-                onClick={submitOrder}
-                disabled={compiledCount === 0}
-                className="flex h-13 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-base font-bold text-white shadow-md disabled:opacity-40"
-              >
-                <Send className="size-5" /> Invia a responsabile ({compiledCount} prodotti)
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+                {o.note && <p className="mb-2 text-sm italic text-ink/60">&ldquo;{o.note}&rdquo;</p>}
+                {isResp && o.status === 'pending' && (
+                  <button
+                    onClick={() => setStatus(o.id, 'received')}
+                    className="mt-2 flex h-10 w-full items-center justify-center gap-1 rounded-xl bg-basil text-sm font-semibold text-white"
+                  >
+                    <Check className="size-4" /> Preso in carico
+                  </button>
+                )}
+                {isResp && o.status === 'received' && (
+                  <button
+                    onClick={() => setStatus(o.id, 'done')}
+                    className="mt-2 flex h-10 w-full items-center justify-center gap-1 rounded-xl bg-ink text-sm font-semibold text-white"
+                  >
+                    <Check className="size-4" /> Segna completato
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       {toast && (
         <div
@@ -1640,320 +1817,6 @@ function StatusBadge({ status }: { status: Order['status'] }) {
   const m = map[status];
   return (
     <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${m.cls}`}>{m.label}</span>
-  );
-}
-
-/* ─── Sezione Catalogo / Merce Base ────────────────────── */
-function CatalogSection({ currentUser }: { currentUser: User }) {
-  const isResp = currentUser.role === 'responsabile';
-  const [products, setProducts] = useState<Product[]>([]);
-  const [items, setItems] = useState<Item[]>([]);
-  const [search, setSearch] = useState('');
-  const [filterCat, setFilterCat] = useState<Category | 'tutti'>('tutti');
-  const [draft, setDraft] = useState<{
-    id?: string;
-    name: string;
-    category: Category;
-    unit: string;
-    defaultMin: number;
-  } | null>(null);
-  const [toast, setToast] = useState('');
-
-  useEffect(() => {
-    return onSnapshot(query(productsCol, orderBy('name')), (snap) => {
-      setProducts(
-        snap.docs.map(
-          (d) =>
-            ({
-              category: 'altro',
-              unit: 'kg',
-              defaultMin: 1,
-              ...(d.data() as object),
-              id: d.id,
-            }) as Product,
-        ),
-      );
-    });
-  }, []);
-
-  useEffect(() => {
-    return onSnapshot(query(itemsCol, orderBy('name')), (snap) => {
-      setItems(
-        snap.docs.map(
-          (d) =>
-            ({
-              min: 1,
-              unit: 'kg',
-              quantity: 0,
-              category: 'altro',
-              zone: 'cella_congelamento',
-              ...(d.data() as object),
-              id: d.id,
-            }) as Item,
-        ),
-      );
-    });
-  }, []);
-
-  useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(''), 2500);
-    return () => clearTimeout(t);
-  }, [toast]);
-
-  const shown = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return products.filter((p) => {
-      if (filterCat !== 'tutti' && p.category !== filterCat) return false;
-      return !q || p.name.toLowerCase().includes(q);
-    });
-  }, [products, search, filterCat]);
-
-  const inStockNames = useMemo(() => new Set(items.map((i) => i.name.toLowerCase())), [items]);
-
-  async function saveProduct() {
-    if (!draft || !draft.name.trim()) return;
-    const n = draft.name.trim();
-    const data = {
-      name: n,
-      category: draft.category,
-      unit: draft.unit,
-      ...(isResp ? { defaultMin: draft.defaultMin } : {}),
-      updatedAt: serverTimestamp(),
-    };
-    if (draft.id) {
-      await updateDoc(doc(db, 'products', draft.id), data);
-    } else {
-      const exists = products.some((p) => p.name.toLowerCase() === n.toLowerCase());
-      if (exists) {
-        setToast('Prodotto già presente');
-        return;
-      }
-      await addDoc(productsCol, {
-        ...data,
-        defaultMin: isResp ? draft.defaultMin : 1,
-        createdAt: serverTimestamp(),
-      });
-    }
-    setDraft(null);
-    setToast('Merce base aggiornata');
-  }
-
-  async function removeProduct(id: string) {
-    await deleteDoc(doc(db, 'products', id));
-    setToast('Prodotto rimosso');
-  }
-
-  async function addToStock(p: Product) {
-    if (inStockNames.has(p.name.toLowerCase())) {
-      setToast('Già presente in giacenza');
-      return;
-    }
-    await addDoc(itemsCol, {
-      name: p.name,
-      quantity: 0,
-      unit: p.unit,
-      min: p.defaultMin,
-      category: p.category,
-      zone: 'cella_congelamento',
-      productId: p.id,
-      updatedAt: serverTimestamp(),
-    });
-    setToast(`"${p.name}" aggiunto in Cella`);
-  }
-
-  return (
-    <div className="px-4">
-      <h2 className="mb-1 font-display text-xl font-extrabold">Merce Base Cucina</h2>
-      <p className="mb-4 text-sm text-ink/60">
-        Elenco di tutta la merce base disponibile per gli ordini e lo stoccaggio in cella.
-      </p>
-
-      <label className="mb-3 flex h-12 items-center gap-3 rounded-2xl bg-white px-4 shadow-sm ring-1 ring-ink/10">
-        <Search className="size-5 text-ink/50" />
-        <input
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Cerca nella merce base"
-          className="h-full flex-1 bg-transparent outline-none"
-        />
-        {search && (
-          <button onClick={() => setSearch('')}>
-            <X className="size-5 text-ink/50" />
-          </button>
-        )}
-      </label>
-
-      <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
-        <button
-          onClick={() => setFilterCat('tutti')}
-          className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
-            filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
-          }`}
-        >
-          Tutti ({products.length})
-        </button>
-        {CATEGORIES.map((c) => (
-          <button
-            key={c.id}
-            onClick={() => setFilterCat(c.id)}
-            className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
-              filterCat === c.id ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
-            }`}
-          >
-            {c.emoji} {c.label}
-          </button>
-        ))}
-      </div>
-
-      {shown.length === 0 ? (
-        <div className="py-12 text-center text-ink/50">
-          <BookOpen className="mx-auto mb-3 size-10" />
-          {products.length === 0
-            ? 'Nessun prodotto base inserito. Tocca "+ Nuovo prodotto base" per iniziare.'
-            : 'Nessun risultato.'}
-        </div>
-      ) : (
-        <ul className="space-y-2">
-          {shown.map((p) => {
-            const cat = CATEGORIES.find((c) => c.id === p.category);
-            const stocked = inStockNames.has(p.name.toLowerCase());
-            return (
-              <li
-                key={p.id}
-                className="flex items-center gap-2 rounded-2xl bg-white p-3 shadow-sm ring-1 ring-ink/10"
-              >
-                <button
-                  className="min-w-0 flex-1 text-left"
-                  onClick={() =>
-                    setDraft({
-                      id: p.id,
-                      name: p.name,
-                      category: p.category,
-                      unit: p.unit,
-                      defaultMin: p.defaultMin,
-                    })
-                  }
-                >
-                  <div className="flex items-center gap-1.5">
-                    <span>{cat?.emoji}</span>
-                    <span className="truncate font-semibold">{p.name}</span>
-                  </div>
-                  <div className="text-xs text-ink/50">
-                    {p.unit} · sotto scorta: {p.defaultMin}
-                    {stocked ? ' · in giacenza' : ''}
-                  </div>
-                </button>
-                {!stocked && (
-                  <button
-                    onClick={() => addToStock(p)}
-                    className="rounded-full bg-basil/15 px-3 py-1.5 text-xs font-semibold text-basil"
-                  >
-                    + Cella
-                  </button>
-                )}
-                {isResp && (
-                  <button
-                    onClick={() => removeProduct(p.id)}
-                    className="grid size-9 place-items-center rounded-xl text-tomato"
-                    aria-label={`Elimina ${p.name}`}
-                  >
-                    <Trash2 className="size-4" />
-                  </button>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      )}
-
-      <button
-        onClick={() =>
-          setDraft({ name: search.trim(), category: 'altro', unit: 'kg', defaultMin: 1 })
-        }
-        className="fixed bottom-20 left-1/2 z-20 flex h-14 -translate-x-1/2 items-center gap-2 rounded-full bg-ink px-7 text-base font-semibold text-white shadow-lg active:scale-95"
-      >
-        <Plus className="size-5" /> Nuovo prodotto base
-      </button>
-
-      {draft && (
-        <div className="fixed inset-0 z-40 flex items-end bg-ink/40" onClick={() => setDraft(null)}>
-          <div
-            className="mx-auto w-full max-w-xl space-y-4 rounded-t-3xl bg-white p-5 pb-10"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between">
-              <h3 className="font-display text-xl font-extrabold">
-                {draft.id ? 'Modifica prodotto base' : 'Nuovo prodotto base'}
-              </h3>
-              <button onClick={() => setDraft(null)}>
-                <X className="size-6" />
-              </button>
-            </div>
-            <input
-              autoFocus
-              value={draft.name}
-              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-              placeholder="Nome prodotto"
-              maxLength={60}
-              className="h-12 w-full rounded-xl bg-paper px-4"
-            />
-            <div>
-              <p className="mb-2 text-sm font-semibold">Categoria</p>
-              <div className="flex flex-wrap gap-2">
-                {CATEGORIES.map((c) => (
-                  <button
-                    key={c.id}
-                    onClick={() => setDraft({ ...draft, category: c.id })}
-                    className={`rounded-full px-3 py-1.5 text-sm font-semibold ${
-                      draft.category === c.id ? 'bg-ink text-white' : 'bg-paper'
-                    }`}
-                  >
-                    {c.emoji} {c.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div className="flex gap-2">
-              {STOCK_UNITS.map((u) => (
-                <button
-                  key={u}
-                  onClick={() => setDraft({ ...draft, unit: u })}
-                  className={`h-10 flex-1 rounded-xl text-sm font-semibold ${
-                    draft.unit === u ? 'bg-ink text-white' : 'bg-paper'
-                  }`}
-                >
-                  {u}
-                </button>
-              ))}
-            </div>
-            {isResp && (
-              <Stepper
-                label="Sotto scorta predefinito (Responsabile)"
-                value={draft.defaultMin}
-                onChange={(n) => setDraft({ ...draft, defaultMin: n })}
-              />
-            )}
-            <button
-              onClick={saveProduct}
-              disabled={!draft.name.trim()}
-              className="h-12 w-full rounded-2xl bg-basil font-semibold text-white disabled:opacity-40"
-            >
-              Salva prodotto base
-            </button>
-          </div>
-        </div>
-      )}
-
-      {toast && (
-        <div
-          role="status"
-          className="fixed inset-x-4 bottom-28 mx-auto max-w-sm rounded-xl bg-ink px-4 py-3 text-center text-white shadow-lg"
-        >
-          {toast}
-        </div>
-      )}
-    </div>
   );
 }
 
