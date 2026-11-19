@@ -1,0 +1,6 @@
+{
+  "name": "KitchenOS",
+  "description": "Gestione inventario cucina in tempo reale con allerta scorte via email.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
