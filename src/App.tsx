@@ -3,23 +3,30 @@ import {
   addDoc,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   increment,
+  limit,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   setDoc,
   updateDoc,
+  writeBatch,
 } from 'firebase/firestore';
 import {
+  Archive,
   Check,
+  CheckCheck,
   ChefHat,
+  ClipboardList,
   KeyRound,
   Lock,
   LogOut,
   Minus,
   Package,
+  Pencil,
   Plus,
   Search,
   Send,
@@ -27,20 +34,25 @@ import {
   ShoppingBasket,
   Snowflake,
   Trash2,
+  Undo2,
   UserPlus,
   Users,
   Volume2,
+  WifiOff,
   X,
 } from 'lucide-react';
-import { db } from './firebase';
+import { onAuthStateChanged, signInWithCustomToken, signOut } from 'firebase/auth';
+import { auth, db } from './firebase';
 
 /* ─── Tipi ─────────────────────────────────────────────── */
-type Role = 'operatore' | 'responsabile';
+type Role = 'cuoco' | 'chef';
+type OrderStatus = 'inviata' | 'ordinata' | 'archiviata';
+type TS = { seconds: number };
 type Category = 'carne' | 'pesce' | 'verdure' | 'latticini' | 'pasticceria' | 'altro';
 type StorageZone = 'cella_congelamento' | 'magazzino';
-type OrderUnit = 'kg' | 'l' | 'cartoni' | 'pezzi';
+type OrderUnit = 'kg' | 'l' | 'cartoni' | 'pezzi' | 'conf';
 
-type User = { id: string; name: string; role: Role; pin: string };
+type User = { id: string; name: string; role: Role };
 type Product = {
   id: string;
   name: string;
@@ -81,12 +93,22 @@ type Order = {
   operatorName: string;
   lines: OrderLine[];
   note: string;
-  status: 'pending' | 'received' | 'done';
-  createdAt?: { seconds: number };
+  tags: string[];
+  supplier: string;
+  status: OrderStatus;
+  createdAt?: TS | null;
+  orderedAt?: TS | null;
+  orderedByName?: string;
+  orderedById?: string;
+  archivedAt?: TS | null;
+  archivedByName?: string;
+  editedByName?: string;
+  pending?: boolean; // scritture locali non ancora confermate dal server
 };
 
 const STOCK_UNITS = ['kg', 'l', 'cartoni', 'pezzi', 'conf.'];
-const ORDER_UNITS: OrderUnit[] = ['kg', 'l', 'cartoni', 'pezzi'];
+const ORDER_UNITS: OrderUnit[] = ['kg', 'l', 'cartoni', 'pezzi', 'conf'];
+const UNIT_LABEL: Record<OrderUnit, string> = { kg: 'kg', l: 'lt', cartoni: 'crt', pezzi: 'pz', conf: 'conf' };
 
 const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
   { id: 'carne', label: 'Carne', emoji: '🥩' },
@@ -103,11 +125,69 @@ const ordersCol = collection(db, 'orders');
 const productsCol = collection(db, 'products');
 
 const isLow = (i: Item) => i.quantity <= i.min;
-const STORAGE_KEY = 'kitchenos-user-id';
+
+// Accesso: il PIN è verificato dal server, che restituisce un token Firebase.
+async function authWithServer(url: string, body: object): Promise<string | null> {
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (r.status === 401) return 'PIN errato';
+    if (r.status === 429) {
+      const j = await r.json().catch(() => ({}) as { retryInMin?: number });
+      return `Troppi tentativi. Riprova tra ${j.retryInMin ?? 10} minuti.`;
+    }
+    if (r.status === 503) return 'Server non configurato: avvisa lo chef.';
+    if (!r.ok) return (await r.text().catch(() => '')) || 'Accesso non riuscito.';
+    const { token } = await r.json();
+    await signInWithCustomToken(auth, token);
+    return null;
+  } catch {
+    return 'Serve la connessione per accedere.';
+  }
+}
+
+async function postAuthed(url: string, body: object): Promise<Response> {
+  const tok = await auth.currentUser?.getIdToken();
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+    body: JSON.stringify(body),
+  });
+}
+
+// Notifiche push best-effort (non bloccano mai l'interfaccia).
+function authedPost(url: string, body: object) {
+  postAuthed(url, body).catch(() => {});
+}
+
+// Gestione account (solo Chef, verificato dal server). Restituisce il messaggio d'errore o null.
+async function adminCall(body: object): Promise<string | null> {
+  try {
+    const r = await postAuthed('/api/admin-users', body);
+    if (r.ok) return null;
+    return (await r.text().catch(() => '')) || 'Operazione non riuscita';
+  } catch {
+    return 'Serve la connessione per gestire gli account.';
+  }
+}
+
+// Compatibilità con i dati già presenti (operatore/responsabile, pending/received/done).
+function normalizeRole(r?: string): Role {
+  return r === 'chef' || r === 'responsabile' ? 'chef' : 'cuoco';
+}
+function normalizeStatus(s?: string): OrderStatus {
+  if (s === 'ordinata' || s === 'received') return 'ordinata';
+  if (s === 'archiviata' || s === 'done') return 'archiviata';
+  return 'inviata';
+}
 
 function normalizeOrderUnit(u?: string): OrderUnit {
   if (!u) return 'kg';
   const low = u.toLowerCase().trim();
+  if (low === 'conf' || low === 'conf.' || low === 'confezioni' || low === 'confezione') return 'conf';
   if (low === 'l' || low === 'lt' || low === 'litri') return 'l';
   if (low === 'cartoni' || low === 'cartone' || low === 'ct' || low === 'crt') return 'cartoni';
   if (low === 'pezzi' || low === 'pz' || low === 'pezzo') return 'pezzi';
@@ -181,121 +261,240 @@ async function showPushNotification(title: string, body: string) {
 /* ─── App principale ───────────────────────────────────── */
 export default function App() {
   const [users, setUsers] = useState<User[]>([]);
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authUid, setAuthUid] = useState<string | null | undefined>(undefined);
+  const currentUser = useMemo<User | null>(
+    () => users.find((u) => u.id === authUid) ?? null,
+    [users, authUid],
+  );
   const [booting, setBooting] = useState(true);
-  const [tab, setTab] = useState<'giacenza' | 'ordini' | 'account'>('giacenza');
-  const [pendingOrdersCount, setPendingOrdersCount] = useState(0);
+  const [usersError, setUsersError] = useState('');
+  const [tab, setTab] = useState<'giacenza' | 'ordini' | 'account'>('ordini');
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [ordersError, setOrdersError] = useState('');
+  const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
   const knownOrderIds = useRef<Set<string>>(new Set());
   const initialOrdersLoaded = useRef(false);
+  const prevStatus = useRef<Map<string, OrderStatus>>(new Map());
+  const [flash, setFlash] = useState('');
+  const [seenOrdered, setSeenOrdered] = useState<number | null>(null);
 
   useEffect(() => {
-    const unsub = onSnapshot(query(usersCol, orderBy('name')), (snap) => {
-      const list = snap.docs.map((d) => ({
-        pin: '0000',
-        ...(d.data() as Omit<User, 'id'>),
-        id: d.id,
-      }));
-      setUsers(list);
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const found = list.find((u) => u.id === saved);
-        if (found) setCurrentUser(found);
-        else localStorage.removeItem(STORAGE_KEY);
-      }
-      setBooting(false);
-    });
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () => {
+      window.removeEventListener('online', on);
+      window.removeEventListener('offline', off);
+    };
+  }, []);
+
+  useEffect(() => onAuthStateChanged(auth, (u) => setAuthUid(u ? u.uid : null)), []);
+
+  // Account eliminato dallo chef: esce subito.
+  useEffect(() => {
+    if (authUid && !booting && users.length > 0 && !users.some((u) => u.id === authUid)) {
+      signOut(auth).catch(() => {});
+    }
+  }, [authUid, booting, users]);
+
+  useEffect(() => {
+    if (!flash) return;
+    const t = setTimeout(() => setFlash(''), 10000);
+    return () => clearTimeout(t);
+  }, [flash]);
+
+  // Ultimo momento in cui il cuoco ha guardato la sezione "Ordinato" (per evidenziare le novità).
+  useEffect(() => {
+    if (!currentUser) {
+      setSeenOrdered(null);
+      return;
+    }
+    const k = `kitchenos-seen-${currentUser.id}`;
+    const v = localStorage.getItem(k);
+    if (v) setSeenOrdered(Number(v));
+    else {
+      const now = Math.floor(Date.now() / 1000);
+      localStorage.setItem(k, String(now));
+      setSeenOrdered(now);
+    }
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    const unsub = onSnapshot(
+      query(usersCol, orderBy('name')),
+      (snap) => {
+        const list: User[] = snap.docs.map((d) => {
+          const data = d.data() as { name?: string; pin?: string; role?: string };
+          return {
+            id: d.id,
+            name: data.name ?? '?',
+            role: normalizeRole(data.role),
+          };
+        });
+        setUsers(list);
+        setUsersError('');
+        setBooting(false);
+      },
+      () => {
+        setUsersError('Impossibile caricare gli account. Controlla la connessione.');
+        setBooting(false);
+      },
+    );
     return unsub;
   }, []);
 
+  // Un solo ascolto in tempo reale delle richieste, condiviso da tutte le schermate.
   useEffect(() => {
-    if (!currentUser || currentUser.role !== 'responsabile') {
-      setPendingOrdersCount(0);
+    if (!currentUser) {
+      setOrders([]);
       initialOrdersLoaded.current = false;
       knownOrderIds.current.clear();
+      prevStatus.current = new Map();
       return;
     }
+    const meId = currentUser.id;
+    const meChef = currentUser.role === 'chef';
 
-    const unsub = onSnapshot(query(ordersCol, orderBy('createdAt', 'desc')), (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Order, 'id'>) }));
-      const pending = list.filter((o) => o.status === 'pending');
-      setPendingOrdersCount(pending.length);
+    const unsub = onSnapshot(
+      query(ordersCol, orderBy('createdAt', 'desc'), limit(300)),
+      (snap) => {
+        const list: Order[] = snap.docs.map((d) => {
+          const data = d.data() as Record<string, any>;
+          return {
+            ...(data as object),
+            id: d.id,
+            status: normalizeStatus(data.status),
+            note: data.note ?? '',
+            tags: Array.isArray(data.tags) ? data.tags : [],
+            supplier: data.supplier ?? '',
+            lines: Array.isArray(data.lines) ? data.lines : [],
+            pending: d.metadata.hasPendingWrites,
+          } as Order;
+        });
+        setOrders(list);
+        setOrdersError('');
 
-      if (!initialOrdersLoaded.current) {
-        list.forEach((o) => knownOrderIds.current.add(o.id));
-        initialOrdersLoaded.current = true;
-        return;
-      }
+        // Il cuoco viene avvisato quando lo chef segna "Ordinato" (suono + banner + notifica).
+        const justOrdered = list.filter(
+          (o) => prevStatus.current.get(o.id) === 'inviata' && o.status === 'ordinata' && !o.pending,
+        );
+        prevStatus.current = new Map(list.map((o) => [o.id, o.status]));
+        if (!meChef && initialOrdersLoaded.current && justOrdered.length > 0) {
+          playNotifySound();
+          const names = justOrdered
+            .flatMap((o) => o.lines.map((l) => l.name))
+            .slice(0, 6)
+            .join(', ');
+          setFlash(`Ordinato dallo chef: ${names}`);
+          showPushNotification('Merce ordinata', names);
+        }
 
-      list.forEach((o) => {
-        if (!knownOrderIds.current.has(o.id)) {
+        if (!initialOrdersLoaded.current) {
+          list.forEach((o) => knownOrderIds.current.add(o.id));
+          initialOrdersLoaded.current = true;
+          return;
+        }
+        list.forEach((o) => {
+          if (knownOrderIds.current.has(o.id)) return;
           knownOrderIds.current.add(o.id);
-          if (o.status === 'pending') {
+          if (meChef && o.status === 'inviata' && o.operatorId !== meId && !o.pending) {
             playNotifySound();
             const summary = o.lines
-              .map((l) => `${l.name} (${l.quantity} ${l.unit})`)
+              .map((l) => `${l.name} (${l.quantity} ${UNIT_LABEL[l.unit] ?? l.unit})`)
               .join(', ');
-            showPushNotification(`Nuovo ordine da ${o.operatorName}`, summary);
+            showPushNotification(`Nuova richiesta da ${o.operatorName}`, summary);
           }
-        }
-      });
-    });
-
+        });
+      },
+      () => setOrdersError('Sincronizzazione richieste non riuscita. Riprovo appena possibile.'),
+    );
     return unsub;
-  }, [currentUser]);
+  }, [currentUser?.id, currentUser?.role]);
 
-  async function login(u: User) {
-    localStorage.setItem(STORAGE_KEY, u.id);
-    setCurrentUser(u);
-    if ('Notification' in window && Notification.permission === 'default') {
-      await Notification.requestPermission();
-    }
-    if (u.role === 'responsabile') {
+  // Registra il dispositivo per le notifiche push (con ruolo, così ogni avviso va alla persona giusta).
+  useEffect(() => {
+    if (!currentUser) return;
+    const u = currentUser;
+    (async () => {
       try {
+        if ('Notification' in window && Notification.permission === 'default') {
+          await Notification.requestPermission();
+        }
         const { registerPushToken } = await import('./firebase');
-        if (typeof registerPushToken === 'function') {
-          const token = await registerPushToken();
-          if (token) {
-            await setDoc(doc(db, 'pushTokens', u.id), {
-              token,
-              userId: u.id,
-              userName: u.name,
-              updatedAt: serverTimestamp(),
-            });
-          }
+        const token = await registerPushToken();
+        if (token) {
+          await setDoc(doc(db, 'pushTokens', u.id), {
+            token,
+            userId: u.id,
+            userName: u.name,
+            role: u.role,
+            updatedAt: serverTimestamp(),
+          });
         }
       } catch {
         /* FCM opzionale se non ancora configurato con VAPID key */
       }
-    }
-  }
+    })();
+  }, [currentUser?.id, currentUser?.role]);
+
+  const login = (userId: string, pin: string) => authWithServer('/api/login', { userId, pin });
+  const setupFirst = (name: string, pin: string) => authWithServer('/api/setup', { name, pin });
 
   function logout() {
-    localStorage.removeItem(STORAGE_KEY);
-    setCurrentUser(null);
-    setTab('giacenza');
+    signOut(auth).catch(() => {});
+    setTab('ordini');
   }
 
-  if (booting) {
+  if (booting || authUid === undefined) {
     return <div className="grid min-h-dvh place-items-center text-ink/50">Caricamento…</div>;
   }
 
-  if (!currentUser) {
-    return <LoginScreen users={users} onLogin={login} />;
+  if (usersError && users.length === 0) {
+    return (
+      <div className="mx-auto flex min-h-dvh max-w-sm flex-col justify-center gap-4 px-6 text-center">
+        <WifiOff className="mx-auto size-12 text-tomato" />
+        <p className="text-lg font-semibold">{usersError}</p>
+        <button
+          onClick={() => window.location.reload()}
+          className="h-14 rounded-2xl bg-basil text-lg font-semibold text-white"
+        >
+          Riprova
+        </button>
+      </div>
+    );
   }
 
-  const isResp = currentUser.role === 'responsabile';
+  if (!currentUser) {
+    return <LoginScreen users={users} onLogin={login} onSetup={setupFirst} />;
+  }
+
+  const isChef = currentUser.role === 'chef';
+  const newCount = orders.filter((o) => o.status === 'inviata').length;
+  const me = currentUser;
+  const newOrdered =
+    isChef || seenOrdered === null
+      ? 0
+      : orders.filter((o) => o.status === 'ordinata' && o.orderedAt && o.orderedAt.seconds > seenOrdered)
+          .length;
+  function markSeen() {
+    const t = Math.max(seenOrdered ?? 0, ...orders.map((o) => o.orderedAt?.seconds ?? 0));
+    if (t === seenOrdered) return;
+    setSeenOrdered(t);
+    localStorage.setItem(`kitchenos-seen-${me.id}`, String(t));
+  }
 
   return (
     <div className="mx-auto min-h-dvh max-w-xl pb-24 pt-4">
-      <header className="mb-4 flex items-center justify-between px-4">
+      <header className="mb-3 flex items-center justify-between px-4">
         <div>
           <h1 className="font-display text-3xl font-extrabold tracking-tight">KitchenOS</h1>
           <p className="text-sm text-ink/60">
-            {currentUser.name} · {isResp ? 'Responsabile' : 'Operatore'}
+            {currentUser.name} · {isChef ? 'Chef' : 'Cuoco'}
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {isResp && (
+          {isChef && (
             <button
               onClick={() => {
                 playNotifySound();
@@ -316,27 +515,51 @@ export default function App() {
         </div>
       </header>
 
-      {tab === 'giacenza' && <InventorySection currentUser={currentUser} />}
-      {tab === 'ordini' && <OrdersSection currentUser={currentUser} />}
-      {tab === 'account' && isResp && <AccountsSection users={users} />}
+      <ConnectionBanner online={online} error={ordersError} />
+      {flash && (
+        <div
+          role="status"
+          className="mx-4 mb-3 flex items-start gap-2 rounded-xl bg-basil px-3 py-2.5 text-sm font-semibold text-white"
+        >
+          <CheckCheck className="mt-0.5 size-4 shrink-0" />
+          <button className="flex-1 text-left" onClick={() => setTab('ordini')}>
+            {flash}
+          </button>
+          <button onClick={() => setFlash('')} aria-label="Chiudi">
+            <X className="size-4" />
+          </button>
+        </div>
+      )}
 
-      {/* Bottom nav: Giacenza, Ordini (con Merce Base integrata), Account */}
+      {tab === 'ordini' && (
+        <OrdersSection
+          currentUser={currentUser}
+          users={users}
+          orders={orders}
+          online={online}
+          newOrdered={newOrdered}
+          onSeenOrdered={markSeen}
+        />
+      )}
+      {tab === 'giacenza' && <InventorySection currentUser={currentUser} />}
+      {tab === 'account' && isChef && <AccountsSection users={users} />}
+
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-ink/10 bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-xl justify-around py-2">
+          <NavBtn
+            active={tab === 'ordini'}
+            onClick={() => setTab('ordini')}
+            icon={<ShoppingBasket className="size-5" />}
+            label="Ordini"
+            badge={isChef ? newCount : newOrdered}
+          />
           <NavBtn
             active={tab === 'giacenza'}
             onClick={() => setTab('giacenza')}
             icon={<Package className="size-5" />}
             label="Giacenza"
           />
-          <NavBtn
-            active={tab === 'ordini'}
-            onClick={() => setTab('ordini')}
-            icon={<ShoppingBasket className="size-5" />}
-            label="Ordini"
-            badge={isResp ? pendingOrdersCount : 0}
-          />
-          {isResp && (
+          {isChef && (
             <NavBtn
               active={tab === 'account'}
               onClick={() => setTab('account')}
@@ -346,6 +569,25 @@ export default function App() {
           )}
         </div>
       </nav>
+    </div>
+  );
+}
+
+function ConnectionBanner({ online, error }: { online: boolean; error: string }) {
+  if (online && !error) return null;
+  return (
+    <div
+      role="alert"
+      className={`mx-4 mb-3 flex items-start gap-2 rounded-xl px-3 py-2.5 text-sm font-semibold ${
+        online ? 'bg-tomato/15 text-tomato' : 'bg-amber-100 text-amber-900'
+      }`}
+    >
+      <WifiOff className="mt-0.5 size-4 shrink-0" />
+      <span>
+        {online
+          ? error
+          : 'Sei offline. Le richieste restano salvate sul telefono e partono appena torna la rete.'}
+      </span>
     </div>
   );
 }
@@ -382,30 +624,42 @@ function NavBtn({
 }
 
 /* ─── Login con PIN ────────────────────────────────────── */
-function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => void }) {
+function LoginScreen({
+  users,
+  onLogin,
+  onSetup,
+}: {
+  users: User[];
+  onLogin: (userId: string, pin: string) => Promise<string | null>;
+  onSetup: (name: string, pin: string) => Promise<string | null>;
+}) {
   const [name, setName] = useState('Simone');
   const [pin, setPin] = useState('');
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [enteredPin, setEnteredPin] = useState('');
-  const [pinError, setPinError] = useState(false);
+  const [pinError, setPinError] = useState('');
+  const [busy, setBusy] = useState(false);
 
   async function createFirst() {
     const n = name.trim();
-    if (!n || pin.length < 4) return;
-    const ref = await addDoc(usersCol, { name: n, role: 'responsabile', pin });
-    onLogin({ id: ref.id, name: n, role: 'responsabile', pin });
+    if (!n || pin.length < 4 || busy) return;
+    setBusy(true);
+    const err = await onSetup(n, pin);
+    setBusy(false);
+    if (err) setPinError(err);
   }
 
-  function handleDigit(d: string) {
-    if (!selectedUser || enteredPin.length >= 4) return;
+  async function handleDigit(d: string) {
+    if (!selectedUser || enteredPin.length >= 4 || busy) return;
     const next = enteredPin + d;
     setEnteredPin(next);
-    setPinError(false);
+    setPinError('');
     if (next.length === 4) {
-      if (next === selectedUser.pin) {
-        onLogin(selectedUser);
-      } else {
-        setPinError(true);
+      setBusy(true);
+      const err = await onLogin(selectedUser.id, next);
+      setBusy(false);
+      if (err) {
+        setPinError(err);
         setTimeout(() => setEnteredPin(''), 450);
       }
     }
@@ -417,12 +671,12 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
         <div className="text-center">
           <ChefHat className="mx-auto mb-3 size-14 text-basil" />
           <h1 className="font-display text-3xl font-extrabold">KitchenOS</h1>
-          <p className="mt-2 text-ink/60">Configura l&apos;account Responsabile</p>
+          <p className="mt-2 text-ink/60">Configura l&apos;account Chef</p>
         </div>
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Nome Responsabile (es. Simone)"
+          placeholder="Nome Chef (es. Simone)"
           maxLength={40}
           className="h-14 rounded-2xl bg-white px-4 text-lg ring-1 ring-ink/10"
         />
@@ -441,8 +695,9 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
           disabled={!name.trim() || pin.length < 4}
           className="h-14 rounded-2xl bg-basil text-lg font-semibold text-white disabled:opacity-40"
         >
-          Crea account Responsabile
+          Crea account Chef
         </button>
+        {pinError && <p className="text-center text-sm font-semibold text-tomato">{pinError}</p>}
       </div>
     );
   }
@@ -472,7 +727,7 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
             />
           ))}
         </div>
-        {pinError && <p className="text-center text-sm font-semibold text-tomato">PIN errato</p>}
+        {pinError && <p className="text-center text-sm font-semibold text-tomato">{pinError}</p>}
 
         <div className="grid grid-cols-3 gap-3">
           {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((d) => (
@@ -488,7 +743,7 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
             onClick={() => {
               setSelectedUser(null);
               setEnteredPin('');
-              setPinError(false);
+              setPinError('');
             }}
             className="h-16 rounded-2xl bg-paper text-sm font-semibold text-ink/60"
           >
@@ -503,7 +758,7 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
           <button
             onClick={() => {
               setEnteredPin((p) => p.slice(0, -1));
-              setPinError(false);
+              setPinError('');
             }}
             className="h-16 rounded-2xl bg-paper text-sm font-semibold text-ink/60"
           >
@@ -528,7 +783,7 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
             onClick={() => {
               setSelectedUser(u);
               setEnteredPin('');
-              setPinError(false);
+              setPinError('');
             }}
             className="flex h-14 w-full items-center gap-3 rounded-2xl bg-white px-4 text-left shadow-sm ring-1 ring-ink/10 active:bg-paper"
           >
@@ -538,7 +793,7 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
             <div className="flex-1">
               <div className="font-semibold">{u.name}</div>
               <div className="text-xs text-ink/50">
-                {u.role === 'responsabile' ? 'Responsabile' : 'Operatore'}
+                {u.role === 'chef' ? 'Chef' : 'Cuoco'}
               </div>
             </div>
             <Lock className="size-4 text-ink/30" />
@@ -546,7 +801,7 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
         ))}
       </ul>
       <p className="text-center text-sm text-ink/40">
-        Gli operatori e i relativi PIN vengono creati dal Responsabile
+        I cuochi e i relativi PIN vengono creati dallo Chef
       </p>
     </div>
   );
@@ -554,7 +809,7 @@ function LoginScreen({ users, onLogin }: { users: User[]; onLogin: (u: User) => 
 
 /* ─── Sezione Giacenza (Cella di congelamento + Magazzino) */
 function InventorySection({ currentUser }: { currentUser: User }) {
-  const isResp = currentUser.role === 'responsabile';
+  const isResp = currentUser.role === 'chef';
   const [items, setItems] = useState<Item[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1119,7 +1374,7 @@ function ItemSheet({
         {canEditMin ? (
           <div className="rounded-2xl bg-paper p-3">
             <Stepper
-              label="Sotto scorta (Responsabile)"
+              label="Sotto scorta (Chef)"
               value={draft.min}
               onChange={(n) => setDraft({ ...draft, min: n })}
             />
@@ -1133,7 +1388,7 @@ function ItemSheet({
               <Lock className="size-4" /> Soglia sotto scorta
             </span>
             <span className="font-bold text-ink">
-              {draft.min} {draft.unit} (solo Responsabile)
+              {draft.min} {draft.unit} (solo Chef)
             </span>
           </div>
         )}
@@ -1169,9 +1424,477 @@ type BaseCatalogRow = {
   defaultUnit: OrderUnit;
 };
 
-function OrdersSection({ currentUser }: { currentUser: User }) {
-  const isResp = currentUser.role === 'responsabile';
-  const [orders, setOrders] = useState<Order[]>([]);
+
+const QUICK_TAGS = ['Urgente', 'Scorta bassa', 'Colazione', 'Servizio'];
+
+const STATUS_META: Record<OrderStatus, { label: string; cls: string }> = {
+  inviata: { label: 'Da ordinare', cls: 'bg-tomato/15 text-tomato' },
+  ordinata: { label: 'Ordinato', cls: 'bg-basil/15 text-basil' },
+  archiviata: { label: 'Archiviato', cls: 'bg-ink/10 text-ink/70' },
+};
+
+function fmtTs(ts?: TS | null) {
+  if (!ts) return '';
+  return new Date(ts.seconds * 1000).toLocaleString('it-IT', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function StatusBadge({ status }: { status: OrderStatus }) {
+  const m = STATUS_META[status];
+  return (
+    <span className={`rounded-full px-2.5 py-1 text-xs font-bold ${m.cls}`}>{m.label}</span>
+  );
+}
+
+function StatusTabBtn({
+  active,
+  onClick,
+  icon,
+  label,
+  count,
+  alert,
+  fresh = 0,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: ReactNode;
+  label: string;
+  count: number;
+  alert?: boolean;
+  fresh?: number;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`relative flex min-h-16 flex-col items-center justify-center gap-1 rounded-2xl px-2 py-2 text-sm font-bold ${
+        active ? 'bg-ink text-white' : 'bg-white text-ink ring-1 ring-ink/10'
+      }`}
+    >
+      {icon}
+      {label}
+      {fresh > 0 && (
+        <span className="absolute left-1.5 top-1.5 rounded-full bg-amber-300 px-1.5 text-[11px] font-bold text-ink">
+          {fresh} nuov{fresh === 1 ? 'o' : 'i'}
+        </span>
+      )}
+      {count > 0 && (
+        <span
+          className={`absolute right-1.5 top-1.5 grid min-w-6 place-items-center rounded-full px-1.5 text-xs font-bold tabular-nums text-white ${
+            alert ? 'bg-tomato' : 'bg-basil'
+          }`}
+        >
+          {count}
+        </span>
+      )}
+    </button>
+  );
+}
+
+function OrderCard({
+  o,
+  isChef,
+  mine,
+  onChange,
+  onSave,
+  onDelete,
+  onRepeat,
+}: {
+  o: Order;
+  isChef: boolean;
+  mine: boolean;
+  onChange: (o: Order, to: OrderStatus) => void;
+  onSave: (o: Order, lines: OrderLine[], note: string, supplier: string) => void;
+  onDelete: (o: Order) => void;
+  onRepeat: (o: Order) => void;
+}) {
+  const [confirmDel, setConfirmDel] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [lines, setLines] = useState<OrderLine[]>(o.lines);
+  const [note, setNote] = useState(o.note);
+  const [supplier, setSupplier] = useState(o.supplier);
+  const urgent = o.tags.includes('Urgente') && o.status === 'inviata';
+
+  function startEdit() {
+    setLines(o.lines.map((l) => ({ ...l })));
+    setNote(o.note);
+    setSupplier(o.supplier);
+    setEditing(true);
+  }
+
+  function patchLine(idx: number, patch: Partial<OrderLine>) {
+    setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
+  }
+
+  return (
+    <li
+      className={`rounded-2xl bg-white p-4 shadow-sm ring-1 ${
+        urgent ? 'ring-2 ring-tomato' : 'ring-ink/10'
+      }`}
+    >
+      <div className="mb-2 flex items-start justify-between gap-2">
+        <div>
+          <div className="text-base font-bold">
+            {mine ? 'Tu' : o.operatorName}
+            {o.supplier && <span className="font-medium text-ink/60"> · {o.supplier}</span>}
+          </div>
+          <div className="text-xs text-ink/50">
+            {o.createdAt ? `Inviata ${fmtTs(o.createdAt)}` : 'Invio in corso…'}
+          </div>
+        </div>
+        <StatusBadge status={o.status} />
+      </div>
+
+      {o.tags.length > 0 && (
+        <div className="mb-2 flex flex-wrap gap-1.5">
+          {o.tags.map((t) => (
+            <span
+              key={t}
+              className={`rounded-full px-2.5 py-0.5 text-xs font-bold ${
+                t === 'Urgente' ? 'bg-tomato text-white' : 'bg-paper text-ink/70'
+              }`}
+            >
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {!editing ? (
+        <ul className="mb-2 divide-y divide-ink/5">
+          {o.lines.map((l, idx) => {
+            const cat = CATEGORIES.find((c) => c.id === l.category);
+            return (
+              <li key={idx} className="flex items-center gap-2 py-2 text-base">
+                <span>{cat?.emoji}</span>
+                <span className="flex-1 font-medium">{l.name}</span>
+                <span className="font-bold tabular-nums">
+                  {l.quantity} {UNIT_LABEL[l.unit] ?? l.unit}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : (
+        <div className="mb-2 space-y-2">
+          {lines.map((l, idx) => (
+            <div key={idx} className="flex items-center gap-1.5 rounded-xl bg-paper p-2">
+              <span className="min-w-0 flex-1 truncate text-sm font-semibold">{l.name}</span>
+              <input
+                type="number"
+                inputMode="decimal"
+                step="0.5"
+                min={0.1}
+                value={l.quantity}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  patchLine(idx, { quantity: Number.isFinite(v) && v > 0 ? v : 1 });
+                }}
+                className="h-11 w-16 rounded-lg bg-white text-center font-display font-extrabold tabular-nums ring-1 ring-ink/10"
+              />
+              <select
+                value={l.unit}
+                onChange={(e) => patchLine(idx, { unit: e.target.value as OrderUnit })}
+                className="h-11 rounded-lg bg-white px-1 text-sm font-semibold ring-1 ring-ink/10"
+              >
+                {ORDER_UNITS.map((u) => (
+                  <option key={u} value={u}>
+                    {UNIT_LABEL[u]}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={() => setLines((prev) => prev.filter((_, i) => i !== idx))}
+                className="grid size-11 place-items-center rounded-lg text-tomato"
+                aria-label={`Rimuovi ${l.name}`}
+              >
+                <X className="size-5" />
+              </button>
+            </div>
+          ))}
+          <input
+            value={supplier}
+            onChange={(e) => setSupplier(e.target.value)}
+            placeholder="Fornitore (opzionale)"
+            maxLength={40}
+            className="h-11 w-full rounded-xl bg-paper px-3 text-sm outline-none"
+          />
+          <input
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="Nota"
+            maxLength={120}
+            className="h-11 w-full rounded-xl bg-paper px-3 text-sm outline-none"
+          />
+          <button
+            onClick={() => (confirmDel ? onDelete(o) : setConfirmDel(true))}
+            className="h-11 w-full rounded-xl text-sm font-bold text-tomato ring-1 ring-tomato/30"
+          >
+            {confirmDel ? 'Tocca ancora per confermare il ritiro' : 'Ritira richiesta'}
+          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setEditing(false)}
+              className="h-12 flex-1 rounded-xl bg-paper font-semibold"
+            >
+              Annulla
+            </button>
+            <button
+              disabled={lines.length === 0}
+              onClick={() => {
+                onSave(o, lines, note.trim(), supplier.trim());
+                setEditing(false);
+              }}
+              className="flex h-12 flex-1 items-center justify-center gap-1 rounded-xl bg-basil font-semibold text-white disabled:opacity-40"
+            >
+              <Check className="size-4" /> Salva
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!editing && o.note && (
+        <p className="mb-2 text-sm italic text-ink/60">&ldquo;{o.note}&rdquo;</p>
+      )}
+      {o.editedByName && !editing && (
+        <p className="mb-1 text-xs text-ink/50">Modificata da {o.editedByName}</p>
+      )}
+      {o.orderedAt && o.status !== 'inviata' && (
+        <p className="text-sm font-semibold text-basil">
+          Ordinata il {fmtTs(o.orderedAt)}
+          {o.orderedByName ? ` · ${o.orderedByName}` : ''}
+        </p>
+      )}
+      {o.archivedAt && o.status === 'archiviata' && (
+        <p className="text-sm text-ink/60">
+          Archiviata il {fmtTs(o.archivedAt)}
+          {o.archivedByName ? ` · ${o.archivedByName}` : ''}
+        </p>
+      )}
+      {o.pending && (
+        <p className="mt-1 text-xs font-semibold text-amber-800">
+          In attesa di sincronizzazione con il server
+        </p>
+      )}
+
+      {!editing && (
+        <div className="mt-3 space-y-2">
+          {o.status === 'inviata' && (isChef || mine) && (
+            <div className="flex gap-2">
+              <button
+                onClick={startEdit}
+                className="flex h-14 w-16 shrink-0 items-center justify-center rounded-xl bg-paper"
+                aria-label="Modifica richiesta"
+              >
+                <Pencil className="size-5" />
+              </button>
+              {isChef ? (
+                <button
+                  onClick={() => onChange(o, 'ordinata')}
+                  className="flex h-14 flex-1 items-center justify-center gap-2 rounded-xl bg-basil text-base font-bold text-white"
+                >
+                  <CheckCheck className="size-5" /> Segna Ordinato
+                </button>
+              ) : (
+                <p className="flex h-14 flex-1 items-center rounded-xl bg-amber-100 px-3 text-sm font-bold text-amber-900">
+                  In attesa che lo chef ordini
+                </p>
+              )}
+            </div>
+          )}
+          {isChef && o.status === 'ordinata' && (
+            <div className="flex gap-2">
+              <button
+                onClick={() => onChange(o, 'inviata')}
+                className="flex h-14 w-16 shrink-0 items-center justify-center rounded-xl bg-paper"
+                aria-label="Riporta in Da ordinare"
+              >
+                <Undo2 className="size-5" />
+              </button>
+              <button
+                onClick={startEdit}
+                className="flex h-14 w-16 shrink-0 items-center justify-center rounded-xl bg-paper"
+                aria-label="Modifica ordine"
+              >
+                <Pencil className="size-5" />
+              </button>
+              <button
+                onClick={() => onChange(o, 'archiviata')}
+                className="flex h-14 flex-1 items-center justify-center gap-2 rounded-xl bg-ink text-base font-bold text-white"
+              >
+                <Archive className="size-5" /> Merce arrivata · Archivia
+              </button>
+            </div>
+          )}
+          {isChef && o.status === 'archiviata' && (
+            <div className="flex gap-2">
+              <button
+                onClick={startEdit}
+                className="flex h-12 w-14 shrink-0 items-center justify-center rounded-xl bg-paper"
+                aria-label="Modifica ordine archiviato"
+              >
+                <Pencil className="size-4" />
+              </button>
+              <button
+                onClick={() => onChange(o, 'ordinata')}
+                className="flex h-12 flex-1 items-center justify-center gap-2 rounded-xl bg-paper text-sm font-bold"
+              >
+                <Undo2 className="size-4" /> Ripristina in Ordinato
+              </button>
+            </div>
+          )}
+          {isChef && o.status !== 'inviata' && (
+            <button
+              onClick={() => (confirmDel ? onDelete(o) : setConfirmDel(true))}
+              className="h-11 w-full rounded-xl text-sm font-bold text-tomato ring-1 ring-tomato/30"
+            >
+              {confirmDel ? 'Tocca ancora per eliminare definitivamente' : 'Elimina dallo storico'}
+            </button>
+          )}
+          {o.status !== 'inviata' && (
+            <button
+              onClick={() => onRepeat(o)}
+              className="flex h-11 w-full items-center justify-center gap-2 rounded-xl text-sm font-bold text-basil ring-1 ring-basil/30"
+            >
+              <Plus className="size-4" /> Ripeti questa richiesta
+            </button>
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
+type StockEntry = {
+  name: string;
+  unit: OrderUnit;
+  qty: number;
+  cooks: string[];
+  at?: TS | null;
+  by?: string;
+};
+
+function StockBadges({ info }: { info: { wait: StockEntry[]; done: StockEntry[] } }) {
+  if (info.wait.length === 0 && info.done.length === 0) return null;
+  return (
+    <div className="mt-1 flex flex-wrap gap-1">
+      {info.wait.map((e) => (
+        <span
+          key={`w${e.unit}`}
+          className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-bold text-amber-900"
+        >
+          In attesa: {Number(e.qty.toFixed(2))} {UNIT_LABEL[e.unit]} ({e.cooks.join(', ')})
+        </span>
+      ))}
+      {info.done.map((e) => (
+        <span
+          key={`d${e.unit}`}
+          className="rounded-full bg-basil/15 px-2 py-0.5 text-[11px] font-bold text-basil"
+        >
+          Ordinato: {Number(e.qty.toFixed(2))} {UNIT_LABEL[e.unit]}
+          {e.at ? ` · ${fmtTs(e.at)}` : ''}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// Vista "per prodotto": cosa è in attesa di essere ordinato e cosa è già stato ordinato.
+function ProductOverview({
+  wait,
+  done,
+  query,
+}: {
+  wait: StockEntry[];
+  done: StockEntry[];
+  query: string;
+}) {
+  const q = query.trim().toLowerCase();
+  const prep = (a: StockEntry[]) =>
+    a
+      .filter((e) => !q || e.name.toLowerCase().includes(q))
+      .sort((x, y) => x.name.localeCompare(y.name, 'it'));
+  const block = (title: string, list: StockEntry[], tone: string, empty: string, ordered: boolean) => (
+    <div className="space-y-2">
+      <h3 className={`font-display text-lg font-extrabold ${tone}`}>
+        {title} ({list.length})
+      </h3>
+      {list.length === 0 ? (
+        <p className="rounded-xl bg-white p-4 text-sm text-ink/60 ring-1 ring-ink/10">{empty}</p>
+      ) : (
+        <ul className="divide-y divide-ink/5 rounded-2xl bg-white px-3 ring-1 ring-ink/10">
+          {list.map((e) => (
+            <li key={`${e.name}|${e.unit}`} className="flex items-center gap-3 py-3">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-base font-semibold">{e.name}</div>
+                <div className="text-xs text-ink/50">
+                  {ordered
+                    ? `${e.at ? fmtTs(e.at) : 'In sincronizzazione'}${e.by ? ` · ${e.by}` : ''}`
+                    : `Richiesto da ${e.cooks.join(', ')}`}
+                </div>
+              </div>
+              <div className="font-display text-lg font-extrabold tabular-nums">
+                {Number(e.qty.toFixed(2))} {UNIT_LABEL[e.unit]}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+  return (
+    <div className="space-y-5">
+      {block('In attesa di essere ordinata', prep(wait), 'text-tomato', 'Niente in attesa: tutto quello richiesto è già stato ordinato.', false)}
+      {block('Già ordinata (in arrivo)', prep(done), 'text-basil', 'Nessuna merce ordinata in questo momento.', true)}
+    </div>
+  );
+}
+
+function statusPatch(from: OrderStatus, to: OrderStatus, chef: User): Record<string, unknown> {
+  const base = { status: to, updatedAt: serverTimestamp() };
+  if (to === 'inviata') {
+    return {
+      ...base,
+      orderedAt: deleteField(),
+      orderedByName: deleteField(),
+      orderedById: deleteField(),
+      archivedAt: deleteField(),
+      archivedByName: deleteField(),
+    };
+  }
+  if (to === 'ordinata' && from === 'archiviata') {
+    return { ...base, archivedAt: deleteField(), archivedByName: deleteField() };
+  }
+  if (to === 'ordinata') {
+    return {
+      ...base,
+      orderedAt: serverTimestamp(),
+      orderedByName: chef.name,
+      orderedById: chef.id,
+    };
+  }
+  return { ...base, archivedAt: serverTimestamp(), archivedByName: chef.name };
+}
+
+function OrdersSection({
+  currentUser,
+  users,
+  orders,
+  online,
+  newOrdered,
+  onSeenOrdered,
+}: {
+  currentUser: User;
+  users: User[];
+  orders: Order[];
+  online: boolean;
+  newOrdered: number;
+  onSeenOrdered: () => void;
+}) {
+  const isChef = currentUser.role === 'chef';
   const [products, setProducts] = useState<Product[]>([]);
   const [draftLines, setDraftLines] = useState<Record<string, { qty: number; unit: OrderUnit }>>({});
   const [newName, setNewName] = useState('');
@@ -1180,19 +1903,23 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
   const [search, setSearch] = useState('');
   const [filterCat, setFilterCat] = useState<Category | 'tutti'>('tutti');
   const [note, setNote] = useState('');
-  const [filterOperator, setFilterOperator] = useState<string>('tutti');
-  const [submitting, setSubmitting] = useState(false);
-  const [toast, setToast] = useState('');
+  const [supplier, setSupplier] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
+  const [showComposer, setShowComposer] = useState(false);
+  const [statusTab, setStatusTab] = useState<OrderStatus>('inviata');
+  const [cookFilter, setCookFilter] = useState('tutti');
+  const [orderSearch, setOrderSearch] = useState('');
+  const [archiveShown, setArchiveShown] = useState(30);
+  const [showSummary, setShowSummary] = useState(false);
+  const [snack, setSnack] = useState<{ text: string; undo?: () => void } | null>(null);
+  const [view, setView] = useState<'richieste' | 'prodotti'>('richieste');
 
   useEffect(() => {
-    return onSnapshot(query(ordersCol, orderBy('createdAt', 'desc')), (snap) => {
-      let list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Order, 'id'>) }));
-      if (!isResp) {
-        list = list.filter((o) => o.operatorId === currentUser.id);
-      }
-      setOrders(list);
-    });
-  }, [currentUser.id, isResp]);
+    if (statusTab === 'ordinata' || view === 'prodotti') onSeenOrdered();
+  }, [statusTab, view, orders.length]);
+
+  const toast = (text: string) => setSnack({ text });
+  const failToast = () => toast('Operazione non riuscita. Controlla la connessione e riprova.');
 
   useEffect(() => {
     return onSnapshot(query(productsCol, orderBy('name')), (snap) => {
@@ -1212,10 +1939,10 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
   }, []);
 
   useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(''), 2500);
+    if (!snack) return;
+    const t = setTimeout(() => setSnack(null), snack.undo ? 7000 : 2500);
     return () => clearTimeout(t);
-  }, [toast]);
+  }, [snack]);
 
   const baseRows = useMemo<BaseCatalogRow[]>(() => {
     const q = search.trim().toLowerCase();
@@ -1236,13 +1963,8 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
   function addPlusToList(row: BaseCatalogRow) {
     setDraftLines((prev) => {
       const cur = prev[row.key];
-      if (!cur) {
-        return { ...prev, [row.key]: { qty: 1, unit: row.defaultUnit || 'kg' } };
-      }
-      return {
-        ...prev,
-        [row.key]: { qty: Number((cur.qty + 1).toFixed(2)), unit: cur.unit },
-      };
+      if (!cur) return { ...prev, [row.key]: { qty: 1, unit: row.defaultUnit || 'kg' } };
+      return { ...prev, [row.key]: { qty: Number((cur.qty + 1).toFixed(2)), unit: cur.unit } };
     });
   }
 
@@ -1267,19 +1989,19 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
     });
   }
 
-  async function addBaseProduct() {
+  function addBaseProduct() {
     const n = newName.trim();
     if (!n) return;
     const existing = products.find((p) => p.name.toLowerCase() === n.toLowerCase());
     if (!existing) {
-      await addDoc(productsCol, {
+      addDoc(productsCol, {
         name: n,
         category: newCat,
         unit: newUnit,
         defaultMin: 1,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
+      }).catch(() => toast('Prodotto non salvato nel catalogo'));
     }
     const key = n.toLowerCase();
     setDraftLines((prev) => ({
@@ -1290,13 +2012,13 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
       },
     }));
     setNewName('');
-    setToast(`"${n}" aggiunto alla lista`);
+    toast(`"${n}" aggiunto alla richiesta`);
   }
 
-  async function removeBaseProduct(id: string) {
-    if (!isResp) return;
-    await deleteDoc(doc(db, 'products', id));
-    setToast('Prodotto rimosso');
+  function removeBaseProduct(id: string) {
+    if (!isChef) return;
+    deleteDoc(doc(db, 'products', id)).catch(failToast);
+    toast('Prodotto rimosso');
   }
 
   const selectedList = useMemo(() => {
@@ -1314,411 +2036,732 @@ function OrdersSection({ currentUser }: { currentUser: User }) {
       });
   }, [draftLines, products]);
 
-  async function sendOrderList() {
-    if (selectedList.length === 0 || submitting) return;
-    setSubmitting(true);
-    try {
-      const lines: OrderLine[] = selectedList.map((l) => ({
-        productKey: l.productKey,
-        name: l.name,
-        quantity: l.quantity,
-        unit: l.unit,
-        category: l.category,
-      }));
+  function toggleTag(t: string) {
+    setTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
+  }
 
-      await addDoc(ordersCol, {
-        operatorId: currentUser.id,
-        operatorName: currentUser.name,
-        lines,
-        note: note.trim(),
-        status: 'pending',
-        createdAt: serverTimestamp(),
+  // Non blocca l'interfaccia: offline Firestore tiene la richiesta in coda e la invia al ritorno della rete.
+  function sendOrderList() {
+    if (selectedList.length === 0) return;
+    const lines: OrderLine[] = selectedList.map((l) => ({
+      productKey: l.productKey,
+      name: l.name,
+      quantity: l.quantity,
+      unit: l.unit,
+      category: l.category,
+    }));
+    const saved = { draftLines, note, supplier, tags };
+
+    addDoc(ordersCol, {
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      lines,
+      note: note.trim(),
+      supplier: supplier.trim(),
+      tags,
+      status: 'inviata',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    }).catch(() => {
+      // Rifiutata dal server: ripristino la bozza per non perdere il lavoro.
+      setDraftLines(saved.draftLines);
+      setNote(saved.note);
+      setSupplier(saved.supplier);
+      setTags(saved.tags);
+      setShowComposer(true);
+      toast('Richiesta NON inviata. Riprova.');
+    });
+
+    if (online) {
+      authedPost('/api/notify-order', { operatorName: currentUser.name, lines });
+    }
+
+    setDraftLines({});
+    setNote('');
+    setSupplier('');
+    setTags([]);
+    setShowComposer(false);
+    setStatusTab('inviata');
+    toast(
+      online ? 'Richiesta inviata allo chef' : 'Salvata offline: parte appena torna la rete',
+    );
+  }
+
+  // Avvisa via push i cuochi le cui richieste sono state ordinate (best-effort).
+  function notifyCooks(list: Order[]) {
+    if (!online) return;
+    const userIds = Array.from(new Set(list.map((o) => o.operatorId))).filter(
+      (id) => id && id !== currentUser.id,
+    );
+    if (userIds.length === 0) return;
+    authedPost('/api/notify-status', {
+        userIds: userIds.slice(0, 10),
+        chefName: currentUser.name,
+        products: list.flatMap((o) => o.lines.map((l) => l.name)).slice(0, 20),
       });
+  }
 
-      fetch('/api/notify-order', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          operatorName: currentUser.name,
-          lines,
-        }),
-      }).catch(() => {});
+  function deleteOrder(o: Order) {
+    deleteDoc(doc(db, 'orders', o.id)).catch(failToast);
+    toast('Richiesta eliminata');
+  }
 
-      setDraftLines({});
-      setNote('');
-      setToast('Lista inviata al Responsabile');
-    } finally {
-      setSubmitting(false);
+  function repeatOrder(o: Order) {
+    setDraftLines((prev) => {
+      const next = { ...prev };
+      o.lines.forEach((l) => {
+        next[l.name.trim().toLowerCase()] = { qty: l.quantity, unit: l.unit };
+      });
+      return next;
+    });
+    setShowComposer(true);
+    toast('Prodotti copiati nella nuova richiesta');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  /* ─── Azioni dello chef (con annulla) ─── */
+  function changeStatus(o: Order, to: OrderStatus) {
+    if (!isChef) return;
+    const prev = o.status;
+    updateDoc(doc(db, 'orders', o.id), statusPatch(prev, to, currentUser)).catch(failToast);
+    if (to === 'ordinata' && prev === 'inviata') notifyCooks([o]);
+    const text =
+      to === 'archiviata'
+        ? 'Archiviata'
+        : to === 'inviata'
+          ? 'Riportata in Da ordinare'
+          : prev === 'archiviata'
+            ? 'Ripristinata in Ordinato'
+            : 'Segnata come Ordinata';
+    setSnack({
+      text,
+      undo: () => {
+        updateDoc(doc(db, 'orders', o.id), statusPatch(to, prev, currentUser)).catch(failToast);
+        setSnack(null);
+      },
+    });
+  }
+
+  function saveEdit(o: Order, lines: OrderLine[], newNote: string, newSupplier: string) {
+    updateDoc(doc(db, 'orders', o.id), {
+      lines,
+      note: newNote,
+      supplier: newSupplier,
+      editedByName: currentUser.name,
+      updatedAt: serverTimestamp(),
+    }).catch(failToast);
+    toast('Modifiche salvate');
+  }
+
+  /* ─── Liste e contatori ─── */
+  const counts = useMemo(
+    () => ({
+      inviata: orders.filter((o) => o.status === 'inviata').length,
+      ordinata: orders.filter((o) => o.status === 'ordinata').length,
+      archiviata: orders.filter((o) => o.status === 'archiviata').length,
+    }),
+    [orders],
+  );
+
+  const cookNames = useMemo(() => {
+    const s = new Set<string>();
+    users.filter((u) => u.role === 'cuoco').forEach((u) => s.add(u.name));
+    orders.forEach((o) => s.add(o.operatorName));
+    return Array.from(s).sort((a, b) => a.localeCompare(b, 'it'));
+  }, [users, orders]);
+
+  const visible = useMemo(() => {
+    const q = orderSearch.trim().toLowerCase();
+    let list = orders.filter((o) => o.status === statusTab);
+    if (cookFilter === 'miei') list = list.filter((o) => o.operatorId === currentUser.id);
+    else if (cookFilter !== 'tutti') list = list.filter((o) => o.operatorName === cookFilter);
+    if (q) {
+      list = list.filter(
+        (o) =>
+          o.lines.some((l) => l.name.toLowerCase().includes(q)) ||
+          o.note.toLowerCase().includes(q) ||
+          o.supplier.toLowerCase().includes(q),
+      );
+    }
+    const ts = (t?: TS | null) => (t ? t.seconds : Number.MAX_SAFE_INTEGER);
+    const sorted = [...list];
+    if (statusTab === 'inviata') {
+      sorted.sort(
+        (a, b) =>
+          Number(b.tags.includes('Urgente')) - Number(a.tags.includes('Urgente')) ||
+          ts(a.createdAt) - ts(b.createdAt),
+      );
+    } else if (statusTab === 'ordinata') {
+      sorted.sort((a, b) => ts(b.orderedAt) - ts(a.orderedAt));
+    } else {
+      sorted.sort((a, b) => ts(b.archivedAt) - ts(a.archivedAt));
+    }
+    return sorted;
+  }, [orders, statusTab, cookFilter, orderSearch, currentUser.id]);
+
+  // Riepilogo accorpato: stessi prodotti e unità sommati tra le richieste visibili.
+  const summary = useMemo(() => {
+    if (statusTab !== 'inviata') return [];
+    const m = new Map<string, { name: string; unit: OrderUnit; qty: number; supplier: string; cooks: Set<string> }>();
+    visible.forEach((o) =>
+      o.lines.forEach((l) => {
+        const k = `${o.supplier.trim().toLowerCase()}|${l.name.trim().toLowerCase()}|${l.unit}`;
+        const cur = m.get(k) ?? { name: l.name, unit: l.unit, qty: 0, supplier: o.supplier, cooks: new Set<string>() };
+        cur.qty += l.quantity;
+        cur.cooks.add(o.operatorName);
+        m.set(k, cur);
+      }),
+    );
+    return Array.from(m.values()).sort((a, b) => a.supplier.localeCompare(b.supplier, 'it') || a.name.localeCompare(b.name, 'it'));
+  }, [visible, statusTab]);
+
+  function bulkOrder() {
+    if (!isChef || visible.length === 0) return;
+    const ids = visible.slice(0, 400).map((o) => o.id);
+    const batch = writeBatch(db);
+    ids.forEach((id) =>
+      batch.update(doc(db, 'orders', id), statusPatch('inviata', 'ordinata', currentUser)),
+    );
+    batch.commit().catch(failToast);
+    notifyCooks(visible.slice(0, 400));
+    setSnack({
+      text: `${ids.length} richieste segnate come Ordinate`,
+      undo: () => {
+        const b = writeBatch(db);
+        ids.forEach((id) =>
+          b.update(doc(db, 'orders', id), statusPatch('ordinata', 'inviata', currentUser)),
+        );
+        b.commit().catch(failToast);
+        setSnack(null);
+      },
+    });
+  }
+
+  const productView = useMemo(() => {
+    const mk = (st: OrderStatus) => {
+      const m = new Map<string, StockEntry>();
+      orders
+        .filter((o) => o.status === st)
+        .forEach((o) =>
+          o.lines.forEach((l) => {
+            const k = `${l.name.trim().toLowerCase()}|${l.unit}`;
+            const cur = m.get(k) ?? { name: l.name, unit: l.unit, qty: 0, cooks: [], at: null, by: '' };
+            cur.qty += l.quantity;
+            if (!cur.cooks.includes(o.operatorName)) cur.cooks.push(o.operatorName);
+            const t = st === 'ordinata' ? o.orderedAt : o.createdAt;
+            if (t && (!cur.at || t.seconds > cur.at.seconds)) {
+              cur.at = t;
+              if (st === 'ordinata') cur.by = o.orderedByName ?? '';
+            }
+            m.set(k, cur);
+          }),
+        );
+      return Array.from(m.values());
+    };
+    return { wait: mk('inviata'), done: mk('ordinata') };
+  }, [orders]);
+
+  const statusOfName = (name: string) => {
+    const n = name.trim().toLowerCase();
+    const same = (e: StockEntry) => e.name.trim().toLowerCase() === n;
+    return { wait: productView.wait.filter(same), done: productView.done.filter(same) };
+  };
+
+  function summaryText() {
+    const by = new Map<string, string[]>();
+    summary.forEach((x) => {
+      const k = x.supplier || 'Da ordinare';
+      by.set(k, [...(by.get(k) ?? []), `- ${x.name}: ${Number(x.qty.toFixed(2))} ${UNIT_LABEL[x.unit]}`]);
+    });
+    return Array.from(by.entries())
+      .map(([k, v]) => `${k}\n${v.join('\n')}`)
+      .join('\n\n');
+  }
+
+  async function shareSummary() {
+    const text = summaryText();
+    try {
+      if (navigator.share) {
+        await navigator.share({ text });
+        return;
+      }
+      await navigator.clipboard.writeText(text);
+      toast('Lista copiata negli appunti');
+    } catch {
+      /* condivisione annullata */
     }
   }
 
-  async function setStatus(id: string, status: Order['status']) {
-    await updateDoc(doc(db, 'orders', id), { status });
+  function exportCsv() {
+    const q = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rows = [
+      ['Richiesta', 'Cuoco', 'Prodotto', 'Quantità', 'Unità', 'Fornitore', 'Tag', 'Nota', 'Ordinata il', 'Ordinata da', 'Archiviata il'],
+    ];
+    visible.forEach((o) =>
+      o.lines.forEach((l) =>
+        rows.push([
+          fmtTs(o.createdAt), o.operatorName, l.name, String(l.quantity), UNIT_LABEL[l.unit] ?? l.unit,
+          o.supplier, o.tags.join(' / '), o.note, fmtTs(o.orderedAt), o.orderedByName ?? '', fmtTs(o.archivedAt),
+        ]),
+      ),
+    );
+    const csv = '\uFEFF' + rows.map((r) => r.map(q).join(';')).join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    a.download = `archivio-ordini-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
 
-  const operatorsInOrders = useMemo(() => {
-    const names = Array.from(new Set(orders.map((o) => o.operatorName)));
-    return names.sort((a, b) => a.localeCompare(b, 'it'));
-  }, [orders]);
+  const shownOrders = statusTab === 'archiviata' ? visible.slice(0, archiveShown) : visible;
 
-  const visibleOrders = useMemo(() => {
-    if (!isResp || filterOperator === 'tutti') return orders;
-    return orders.filter((o) => o.operatorName === filterOperator);
-  }, [orders, isResp, filterOperator]);
-
-  const pendingCount = orders.filter((o) => o.status === 'pending').length;
+  const emptyText: Record<OrderStatus, string> = {
+    inviata: 'Nessuna richiesta in attesa.',
+    ordinata: 'Nessun ordine in corso: la merce non è stata ancora ordinata.',
+    archiviata: 'Archivio vuoto.',
+  };
 
   return (
-    <div className="space-y-6 px-4">
-      {/* Merce Base unificata in Ordini con + per aggiungere alla lista */}
-      <section className="space-y-3 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
-        <div>
-          <h2 className="font-display text-xl font-extrabold">Merce Base & Lista Ordine</h2>
-          <p className="text-sm text-ink/60">
-            Aggiungi i prodotti con <strong>+</strong>, imposta quantità e unità (kg, l, cartoni,
-            pezzi) e invia tutta la lista al responsabile.
-          </p>
-        </div>
+    <div className="space-y-4 px-4">
+      <button
+        onClick={() => setShowComposer((v) => !v)}
+        className="flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-lg font-bold text-white"
+      >
+        <Plus className="size-5" /> Nuova richiesta
+        {selectedList.length > 0 && ` (${selectedList.length} in bozza)`}
+      </button>
 
-        <div className="flex gap-2">
-          <input
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            placeholder="Nuovo prodotto base..."
-            maxLength={60}
-            className="h-11 flex-1 rounded-xl bg-paper px-3 text-sm outline-none"
-          />
-          <button
-            onClick={addBaseProduct}
-            disabled={!newName.trim()}
-            className="flex h-11 shrink-0 items-center gap-1 rounded-xl bg-basil px-4 text-sm font-semibold text-white disabled:opacity-40"
-          >
-            <Plus className="size-4" /> Aggiungi
-          </button>
-        </div>
+      {showComposer && (
+        <section className="space-y-3 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
+          <div>
+            <h2 className="font-display text-xl font-extrabold">Nuova richiesta</h2>
+            <p className="text-sm text-ink/60">
+              Aggiungi i prodotti con <strong>+</strong>, imposta quantità e unità (kg, lt, crt, pz) e invia la richiesta allo chef.
+            </p>
+          </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap gap-1.5">
+          <div className="flex gap-2">
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="Nuovo prodotto base..."
+              maxLength={60}
+              className="h-11 flex-1 rounded-xl bg-paper px-3 text-sm outline-none"
+            />
+            <button
+              onClick={addBaseProduct}
+              disabled={!newName.trim()}
+              className="flex h-11 shrink-0 items-center gap-1 rounded-xl bg-basil px-4 text-sm font-semibold text-white disabled:opacity-40"
+            >
+              <Plus className="size-4" /> Aggiungi
+            </button>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-1.5">
+              {CATEGORIES.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => setNewCat(c.id)}
+                  className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                    newCat === c.id ? 'bg-ink text-white' : 'bg-paper'
+                  }`}
+                >
+                  {c.emoji} {c.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-1">
+              {ORDER_UNITS.map((u) => (
+                <button
+                  key={u}
+                  onClick={() => setNewUnit(u)}
+                  className={`rounded-lg px-2 py-1 text-xs font-semibold ${
+                    newUnit === u ? 'bg-basil text-white' : 'bg-paper'
+                  }`}
+                >{UNIT_LABEL[u]}</button>
+              ))}
+            </div>
+          </div>
+
+          <label className="flex h-11 items-center gap-2 rounded-xl bg-paper px-3">
+            <Search className="size-4 text-ink/50" />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Cerca nella merce base..."
+              className="h-full flex-1 bg-transparent text-sm outline-none"
+            />
+            {search && (
+              <button onClick={() => setSearch('')}>
+                <X className="size-4 text-ink/50" />
+              </button>
+            )}
+          </label>
+
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            <button
+              onClick={() => setFilterCat('tutti')}
+              className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
+                filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-paper'
+              }`}
+            >
+              Tutti
+            </button>
             {CATEGORIES.map((c) => (
               <button
                 key={c.id}
-                onClick={() => setNewCat(c.id)}
-                className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
-                  newCat === c.id ? 'bg-ink text-white' : 'bg-paper'
+                onClick={() => setFilterCat(c.id)}
+                className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
+                  filterCat === c.id ? 'bg-ink text-white' : 'bg-paper'
                 }`}
               >
                 {c.emoji} {c.label}
               </button>
             ))}
           </div>
-          <div className="flex gap-1">
-            {ORDER_UNITS.map((u) => (
+
+          <ul className="max-h-64 space-y-2 overflow-y-auto">
+            {baseRows.map((row) => {
+              const cat = CATEGORIES.find((c) => c.id === row.category);
+              const inList = draftLines[row.key];
+              return (
+                <li
+                  key={row.key}
+                  className="flex items-center justify-between gap-2 rounded-xl bg-paper px-3 py-2"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span>{cat?.emoji}</span>
+                      <span className="truncate text-sm font-semibold">{row.name}</span>
+                    </div>
+                    <div className="text-xs text-ink/50">
+                      {cat?.label} · {UNIT_LABEL[row.defaultUnit]}
+                    </div>
+                  <StockBadges info={statusOfName(row.name)} />
+                  </div>
+                  {inList && (
+                    <span className="rounded-full bg-basil/15 px-2.5 py-0.5 text-xs font-bold text-basil tabular-nums">
+                      {inList.qty} {UNIT_LABEL[inList.unit]}
+                    </span>
+                  )}
+                  {isChef && row.productId && (
+                    <button
+                      onClick={() => removeBaseProduct(row.productId!)}
+                      className="grid size-8 place-items-center rounded-lg text-tomato"
+                      aria-label={`Elimina ${row.name}`}
+                    >
+                      <Trash2 className="size-4" />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => addPlusToList(row)}
+                    className="grid size-9 place-items-center rounded-xl bg-basil text-white"
+                    aria-label={`Aggiungi ${row.name} alla lista`}
+                  >
+                    <Plus className="size-4" />
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+
+          {selectedList.length > 0 && (
+            <div className="space-y-2.5 border-t border-ink/10 pt-3">
+              <h3 className="font-display text-base font-extrabold">
+                Lista da inviare ({selectedList.length})
+              </h3>
+              <ul className="space-y-2">
+                {selectedList.map((line) => (
+                  <li key={line.productKey} className="space-y-2 rounded-xl bg-paper p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-bold">{line.name}</span>
+                      <StockBadges info={statusOfName(line.name)} />
+                    </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => setLineQty(line.productKey, line.quantity - 1)}
+                          className="grid size-8 place-items-center rounded-lg bg-white ring-1 ring-ink/10"
+                        >
+                          <Minus className="size-3.5" />
+                        </button>
+                        <input
+                          type="number"
+                          inputMode="decimal"
+                          step="0.5"
+                          min={0.1}
+                          value={line.quantity}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            setLineQty(line.productKey, Number.isFinite(v) ? v : 0);
+                          }}
+                          className="h-8 w-16 rounded-lg bg-white text-center font-display text-sm font-extrabold tabular-nums ring-1 ring-ink/10"
+                        />
+                        <button
+                          onClick={() => setLineQty(line.productKey, line.quantity + 1)}
+                          className="grid size-8 place-items-center rounded-lg bg-white ring-1 ring-ink/10"
+                        >
+                          <Plus className="size-3.5" />
+                        </button>
+                        <button
+                          onClick={() => setLineQty(line.productKey, 0)}
+                          className="grid size-8 place-items-center rounded-lg text-tomato"
+                          aria-label={`Rimuovi ${line.name}`}
+                        >
+                          <X className="size-4" />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex gap-1.5">
+                      {ORDER_UNITS.map((u) => (
+                        <button
+                          key={u}
+                          onClick={() => setLineUnit(line.productKey, u)}
+                          className={`h-8 flex-1 rounded-lg text-xs font-semibold ${
+                            line.unit === u ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+                          }`}
+                        >{UNIT_LABEL[u]}</button>
+                      ))}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+
+              <div className="space-y-2">
+                <div className="flex flex-wrap gap-2">
+                  {QUICK_TAGS.map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => toggleTag(t)}
+                      className={`h-10 rounded-full px-4 text-sm font-bold ${
+                        tags.includes(t)
+                          ? t === 'Urgente'
+                            ? 'bg-tomato text-white'
+                            : 'bg-ink text-white'
+                          : 'bg-paper'
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  value={supplier}
+                  onChange={(e) => setSupplier(e.target.value)}
+                  placeholder="Fornitore (opzionale)"
+                  maxLength={40}
+                  className="h-11 w-full rounded-xl bg-paper px-3 text-sm outline-none"
+                />
+                <input
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="Nota per lo chef (opzionale)"
+                  maxLength={120}
+                  className="h-11 w-full rounded-xl bg-paper px-3 text-sm outline-none"
+                />
+              </div>
+
               <button
-                key={u}
-                onClick={() => setNewUnit(u)}
-                className={`rounded-lg px-2 py-1 text-xs font-semibold ${
-                  newUnit === u ? 'bg-basil text-white' : 'bg-paper'
-                }`}
+                onClick={sendOrderList}
+                className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-base font-semibold text-white disabled:opacity-40"
               >
-                {u}
+                <Send className="size-4" /> Invia richiesta allo chef ({selectedList.length})
               </button>
-            ))}
-          </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      <section className="space-y-3">
+        <div className="grid grid-cols-2 gap-2">
+          {(
+            [
+              ['richieste', 'Per richiesta'],
+              ['prodotti', 'Stato merce per prodotto'],
+            ] as const
+          ).map(([v, label]) => (
+            <button
+              key={v}
+              onClick={() => setView(v)}
+              className={`h-11 rounded-xl text-sm font-bold ${
+                view === v ? 'bg-basil text-white' : 'bg-white ring-1 ring-ink/10'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
-        <label className="flex h-11 items-center gap-2 rounded-xl bg-paper px-3">
+        <div className={`grid grid-cols-3 gap-2 ${view === 'prodotti' ? 'hidden' : ''}`}>
+          <StatusTabBtn
+            active={statusTab === 'inviata'}
+            onClick={() => setStatusTab('inviata')}
+            icon={<ClipboardList className="size-6" />}
+            label="Da ordinare"
+            count={counts.inviata}
+            alert
+          />
+          <StatusTabBtn
+            active={statusTab === 'ordinata'}
+            onClick={() => setStatusTab('ordinata')}
+            icon={<CheckCheck className="size-6" />}
+            label="Ordinato"
+            count={counts.ordinata}
+            fresh={newOrdered}
+          />
+          <StatusTabBtn
+            active={statusTab === 'archiviata'}
+            onClick={() => setStatusTab('archiviata')}
+            icon={<Archive className="size-6" />}
+            label="Archiviato"
+            count={counts.archiviata}
+          />
+        </div>
+
+        <label className="flex h-12 items-center gap-2 rounded-xl bg-white px-3 ring-1 ring-ink/10">
           <Search className="size-4 text-ink/50" />
           <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Cerca nella merce base..."
-            className="h-full flex-1 bg-transparent text-sm outline-none"
+            value={orderSearch}
+            onChange={(e) => setOrderSearch(e.target.value)}
+            placeholder="Cerca prodotto, fornitore, nota…"
+            className="h-full flex-1 bg-transparent text-base outline-none"
           />
-          {search && (
-            <button onClick={() => setSearch('')}>
+          {orderSearch && (
+            <button onClick={() => setOrderSearch('')} aria-label="Cancella ricerca">
               <X className="size-4 text-ink/50" />
             </button>
           )}
         </label>
 
+        {view === 'prodotti' && (
+          <ProductOverview wait={productView.wait} done={productView.done} query={orderSearch} />
+        )}
+
+        {view === 'richieste' && (<>
         <div className="flex gap-2 overflow-x-auto pb-1">
-          <button
-            onClick={() => setFilterCat('tutti')}
-            className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
-              filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-paper'
-            }`}
-          >
-            Tutti
-          </button>
-          {CATEGORIES.map((c) => (
+          {['tutti', ...(isChef ? [] : ['miei']), ...cookNames].map((c) => (
             <button
-              key={c.id}
-              onClick={() => setFilterCat(c.id)}
-              className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${
-                filterCat === c.id ? 'bg-ink text-white' : 'bg-paper'
+              key={c}
+              onClick={() => setCookFilter(c)}
+              className={`h-10 shrink-0 rounded-full px-4 text-sm font-semibold ${
+                cookFilter === c ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
               }`}
             >
-              {c.emoji} {c.label}
+              {c === 'tutti' ? 'Tutti i cuochi' : c === 'miei' ? 'Le mie' : c}
             </button>
           ))}
         </div>
 
-        <ul className="max-h-64 space-y-2 overflow-y-auto">
-          {baseRows.map((row) => {
-            const cat = CATEGORIES.find((c) => c.id === row.category);
-            const inList = draftLines[row.key];
-            return (
-              <li
-                key={row.key}
-                className="flex items-center justify-between gap-2 rounded-xl bg-paper px-3 py-2"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
-                    <span>{cat?.emoji}</span>
-                    <span className="truncate text-sm font-semibold">{row.name}</span>
-                  </div>
-                  <div className="text-xs text-ink/50">
-                    {cat?.label} · {row.defaultUnit}
-                  </div>
-                </div>
-                {inList && (
-                  <span className="rounded-full bg-basil/15 px-2.5 py-0.5 text-xs font-bold text-basil tabular-nums">
-                    {inList.qty} {inList.unit}
-                  </span>
-                )}
-                {isResp && row.productId && (
-                  <button
-                    onClick={() => removeBaseProduct(row.productId!)}
-                    className="grid size-8 place-items-center rounded-lg text-tomato"
-                    aria-label={`Elimina ${row.name}`}
-                  >
-                    <Trash2 className="size-4" />
-                  </button>
-                )}
-                <button
-                  onClick={() => addPlusToList(row)}
-                  className="grid size-9 place-items-center rounded-xl bg-basil text-white"
-                  aria-label={`Aggiungi ${row.name} alla lista`}
-                >
-                  <Plus className="size-4" />
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-
-        {selectedList.length > 0 && (
-          <div className="space-y-2.5 border-t border-ink/10 pt-3">
-            <h3 className="font-display text-base font-extrabold">
-              Lista da inviare ({selectedList.length})
-            </h3>
-            <ul className="space-y-2">
-              {selectedList.map((line) => (
-                <li key={line.productKey} className="space-y-2 rounded-xl bg-paper p-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-sm font-bold">{line.name}</span>
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        onClick={() => setLineQty(line.productKey, line.quantity - 1)}
-                        className="grid size-8 place-items-center rounded-lg bg-white ring-1 ring-ink/10"
-                      >
-                        <Minus className="size-3.5" />
-                      </button>
-                      <input
-                        type="number"
-                        inputMode="decimal"
-                        step="0.5"
-                        min={0.1}
-                        value={line.quantity}
-                        onChange={(e) => {
-                          const v = parseFloat(e.target.value);
-                          setLineQty(line.productKey, Number.isFinite(v) ? v : 0);
-                        }}
-                        className="h-8 w-16 rounded-lg bg-white text-center font-display text-sm font-extrabold tabular-nums ring-1 ring-ink/10"
-                      />
-                      <button
-                        onClick={() => setLineQty(line.productKey, line.quantity + 1)}
-                        className="grid size-8 place-items-center rounded-lg bg-white ring-1 ring-ink/10"
-                      >
-                        <Plus className="size-3.5" />
-                      </button>
-                      <button
-                        onClick={() => setLineQty(line.productKey, 0)}
-                        className="grid size-8 place-items-center rounded-lg text-tomato"
-                        aria-label={`Rimuovi ${line.name}`}
-                      >
-                        <X className="size-4" />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="flex gap-1.5">
-                    {ORDER_UNITS.map((u) => (
-                      <button
-                        key={u}
-                        onClick={() => setLineUnit(line.productKey, u)}
-                        className={`h-8 flex-1 rounded-lg text-xs font-semibold ${
-                          line.unit === u ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
-                        }`}
-                      >
-                        {u}
-                      </button>
-                    ))}
-                  </div>
-                </li>
-              ))}
-            </ul>
-
-            <input
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              placeholder="Note per il responsabile (opzionale)"
-              maxLength={120}
-              className="h-11 w-full rounded-xl bg-paper px-3 text-sm outline-none"
-            />
-
+        {isChef && statusTab === 'inviata' && visible.length > 0 && (
+          <div className="space-y-2 rounded-2xl bg-white p-3 ring-1 ring-ink/10">
             <button
-              onClick={sendOrderList}
-              disabled={submitting}
-              className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-basil text-base font-semibold text-white disabled:opacity-40"
+              onClick={() => setShowSummary((v) => !v)}
+              className="flex h-11 w-full items-center justify-between text-left font-display text-base font-extrabold"
             >
-              <Send className="size-4" /> Invia lista al responsabile ({selectedList.length})
+              Riepilogo accorpato ({summary.length} prodotti)
+              <span className="text-sm text-ink/50">{showSummary ? 'Chiudi' : 'Apri'}</span>
             </button>
-          </div>
-        )}
-      </section>
-
-      {/* Ordini ricevuti / inviati */}
-      <section>
-        <div className="mb-3 flex items-center justify-between">
-          <div>
-            <h2 className="font-display text-xl font-extrabold">
-              {isResp ? 'Ordini ricevuti' : 'Le mie liste inviate'}
-            </h2>
-            {isResp && pendingCount > 0 && (
-              <p className="text-sm font-semibold text-tomato">{pendingCount} in attesa</p>
+            {showSummary && (
+              <ul className="divide-y divide-ink/5">
+                {summary.map((s) => (
+                  <li key={`${s.supplier}|${s.name}|${s.unit}`} className="flex items-center gap-2 py-2 text-sm">
+                    <span className="flex-1 font-medium">
+                      {s.name}
+                      <span className="block text-xs text-ink/50">
+                        {s.supplier ? `${s.supplier} · ` : ''}{Array.from(s.cooks).join(', ')}
+                      </span>
+                    </span>
+                    <span className="font-bold tabular-nums">
+                      {Number(s.qty.toFixed(2))} {UNIT_LABEL[s.unit]}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             )}
-          </div>
-        </div>
-
-        {isResp && operatorsInOrders.length > 0 && (
-          <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
             <button
-              onClick={() => setFilterOperator('tutti')}
-              className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ${
-                filterOperator === 'tutti' ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
-              }`}
+              onClick={shareSummary}
+              className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-paper text-sm font-bold"
             >
-              Tutti ({orders.length})
+              <Share2 className="size-4" /> Condividi / copia lista per fornitore
             </button>
-            {operatorsInOrders.map((op) => (
-              <button
-                key={op}
-                onClick={() => setFilterOperator(op)}
-                className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ${
-                  filterOperator === op ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
-                }`}
-              >
-                {op}
-              </button>
-            ))}
+            <button
+              onClick={bulkOrder}
+              className="flex h-14 w-full items-center justify-center gap-2 rounded-xl bg-basil text-base font-bold text-white"
+            >
+              <CheckCheck className="size-5" /> Segna tutte Ordinate ({visible.length})
+            </button>
           </div>
         )}
 
-        {visibleOrders.length === 0 ? (
+        {shownOrders.length === 0 ? (
           <div className="py-12 text-center text-ink/60">
             <ShoppingBasket className="mx-auto mb-3 size-10 text-ink/40" />
-            {isResp
-              ? 'Nessun ordine ricevuto ancora.'
-              : 'Non hai ancora inviato alcuna lista.'}
+            {orderSearch || cookFilter !== 'tutti'
+              ? 'Nessun risultato con questi filtri.'
+              : emptyText[statusTab]}
           </div>
         ) : (
           <ul className="space-y-3">
-            {visibleOrders.map((o) => (
-              <li key={o.id} className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
-                <div className="mb-2 flex items-start justify-between gap-2">
-                  <div>
-                    <div className="text-base font-bold">
-                      {isResp ? `Operatore: ${o.operatorName}` : 'Lista inviata'}
-                    </div>
-                    <div className="text-xs text-ink/50">
-                      {o.createdAt
-                        ? new Date(o.createdAt.seconds * 1000).toLocaleString('it-IT', {
-                            day: '2-digit',
-                            month: 'short',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })
-                        : 'Invio in corso…'}
-                    </div>
-                  </div>
-                  <StatusBadge status={o.status} />
-                </div>
-                <ul className="mb-2 divide-y divide-ink/5">
-                  {o.lines.map((l, idx) => {
-                    const cat = CATEGORIES.find((c) => c.id === l.category);
-                    return (
-                      <li key={idx} className="flex items-center gap-2 py-1.5 text-sm">
-                        <span>{cat?.emoji}</span>
-                        <span className="flex-1 font-medium">{l.name}</span>
-                        <span className="font-bold tabular-nums">
-                          {l.quantity} {l.unit}
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-                {o.note && <p className="mb-2 text-sm italic text-ink/60">&ldquo;{o.note}&rdquo;</p>}
-                {isResp && o.status === 'pending' && (
-                  <button
-                    onClick={() => setStatus(o.id, 'received')}
-                    className="mt-2 flex h-10 w-full items-center justify-center gap-1 rounded-xl bg-basil text-sm font-semibold text-white"
-                  >
-                    <Check className="size-4" /> Preso in carico
-                  </button>
-                )}
-                {isResp && o.status === 'received' && (
-                  <button
-                    onClick={() => setStatus(o.id, 'done')}
-                    className="mt-2 flex h-10 w-full items-center justify-center gap-1 rounded-xl bg-ink text-sm font-semibold text-white"
-                  >
-                    <Check className="size-4" /> Segna completato
-                  </button>
-                )}
-              </li>
+            {shownOrders.map((o) => (
+              <OrderCard
+                key={o.id}
+                o={o}
+                isChef={isChef}
+                mine={o.operatorId === currentUser.id}
+                onChange={changeStatus}
+                onSave={saveEdit}
+                onDelete={deleteOrder}
+                onRepeat={repeatOrder}
+              />
             ))}
           </ul>
         )}
+
+        {isChef && statusTab === 'archiviata' && visible.length > 0 && (
+          <button
+            onClick={exportCsv}
+            className="h-12 w-full rounded-xl bg-white font-semibold ring-1 ring-ink/10"
+          >
+            Esporta archivio (CSV)
+          </button>
+        )}
+        {statusTab === 'archiviata' && visible.length > archiveShown && (
+          <button
+            onClick={() => setArchiveShown((n) => n + 30)}
+            className="h-12 w-full rounded-xl bg-white font-semibold ring-1 ring-ink/10"
+          >
+            Mostra altri ({visible.length - archiveShown})
+          </button>
+        )}
+        </>)}
       </section>
 
-      {toast && (
+      {snack && (
         <div
           role="status"
-          className="fixed inset-x-4 bottom-28 mx-auto max-w-sm rounded-xl bg-ink px-4 py-3 text-center text-white shadow-lg"
+          className="fixed inset-x-4 bottom-28 z-40 mx-auto flex max-w-sm items-center justify-between gap-3 rounded-xl bg-ink px-4 py-3 text-white shadow-lg"
         >
-          {toast}
+          <span className="text-sm font-medium">{snack.text}</span>
+          {snack.undo && (
+            <button
+              onClick={snack.undo}
+              className="shrink-0 rounded-lg bg-white/15 px-3 py-2 text-sm font-bold"
+            >
+              Annulla
+            </button>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function StatusBadge({ status }: { status: Order['status'] }) {
-  const map = {
-    pending: { label: 'In attesa', cls: 'bg-tomato/15 text-tomato' },
-    received: { label: 'In carico', cls: 'bg-amber-100 text-amber-800' },
-    done: { label: 'Completato', cls: 'bg-basil/15 text-basil' },
-  };
-  const m = map[status];
-  return (
-    <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${m.cls}`}>{m.label}</span>
-  );
-}
-
-/* ─── Sezione Account con PIN (solo Responsabile) ──────── */
+/* ─── Sezione Account con PIN (solo Chef) ──────── */
 function AccountsSection({ users }: { users: User[] }) {
   const [name, setName] = useState('');
   const [pin, setPin] = useState('');
-  const [role, setRole] = useState<Role>('operatore');
+  const [role, setRole] = useState<Role>('cuoco');
   const [editingPinId, setEditingPinId] = useState<string | null>(null);
   const [newPinValue, setNewPinValue] = useState('');
   const [toast, setToast] = useState('');
@@ -1736,51 +2779,53 @@ function AccountsSection({ users }: { users: User[] }) {
       setToast('Nome già presente');
       return;
     }
-    await addDoc(usersCol, { name: n, role, pin });
+    const err = await adminCall({ action: 'create', name: n, pin, role });
+    if (err) {
+      setToast(err);
+      return;
+    }
     setName('');
     setPin('');
-    setRole('operatore');
-    setToast(`Operatore "${n}" creato con PIN`);
+    setRole('cuoco');
+    setToast(`"${n}" creato con PIN`);
   }
 
   async function saveNewPin(userId: string) {
     if (newPinValue.length < 4) return;
-    await updateDoc(doc(db, 'users', userId), { pin: newPinValue });
+    const err = await adminCall({ action: 'setPin', userId, pin: newPinValue });
+    if (err) {
+      setToast(err);
+      return;
+    }
     setEditingPinId(null);
     setNewPinValue('');
     setToast('PIN aggiornato');
   }
 
   async function removeUser(u: User) {
-    if (users.filter((x) => x.role === 'responsabile').length <= 1 && u.role === 'responsabile') {
-      setToast('Serve almeno un responsabile');
-      return;
-    }
-    await deleteDoc(doc(db, 'users', u.id));
-    setToast(`"${u.name}" rimosso`);
+    if (!window.confirm(`Eliminare l'account di ${u.name}? Le sue richieste restano nello storico.`)) return;
+    const err = await adminCall({ action: 'delete', userId: u.id });
+    setToast(err ?? `"${u.name}" rimosso`);
   }
 
   async function toggleRole(u: User) {
-    const next: Role = u.role === 'operatore' ? 'responsabile' : 'operatore';
-    if (u.role === 'responsabile' && users.filter((x) => x.role === 'responsabile').length <= 1) {
-      setToast('Serve almeno un responsabile');
-      return;
-    }
-    await updateDoc(doc(db, 'users', u.id), { role: next });
+    const next: Role = u.role === 'cuoco' ? 'chef' : 'cuoco';
+    const err = await adminCall({ action: 'setRole', userId: u.id, role: next });
+    if (err) setToast(err);
   }
 
   return (
     <div className="px-4">
-      <h2 className="mb-1 font-display text-xl font-extrabold">Gestione Operatori & PIN</h2>
+      <h2 className="mb-1 font-display text-xl font-extrabold">Gestione Cuochi & PIN</h2>
       <p className="mb-4 text-sm text-ink/60">
-        Crea gli operatori assegnando nome e PIN a 4 cifre per accedere e inviare gli ordini.
+        Crea i cuochi (e lo Chef) assegnando nome e PIN a 4 cifre per accedere e inviare le richieste.
       </p>
 
       <div className="mb-6 space-y-3 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-ink/10">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Nome operatore"
+          placeholder="Nome (es. Cuoco 1)"
           maxLength={40}
           className="h-12 w-full rounded-xl bg-paper px-4"
         />
@@ -1798,7 +2843,7 @@ function AccountsSection({ users }: { users: User[] }) {
           />
         </div>
         <div className="flex gap-2">
-          {(['operatore', 'responsabile'] as Role[]).map((r) => (
+          {(['cuoco', 'chef'] as Role[]).map((r) => (
             <button
               key={r}
               onClick={() => setRole(r)}
@@ -1815,7 +2860,7 @@ function AccountsSection({ users }: { users: User[] }) {
           disabled={!name.trim() || pin.length < 4}
           className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-basil font-semibold text-white disabled:opacity-40"
         >
-          <UserPlus className="size-5" /> Crea operatore
+          <UserPlus className="size-5" /> Crea account
         </button>
       </div>
 
@@ -1833,14 +2878,14 @@ function AccountsSection({ users }: { users: User[] }) {
                 <div className="truncate font-semibold">{u.name}</div>
                 <div className="flex flex-wrap items-center gap-2 text-xs">
                   <button onClick={() => toggleRole(u)} className="font-medium text-basil underline">
-                    {u.role === 'responsabile' ? 'Responsabile' : 'Operatore'}
+                    {u.role === 'chef' ? 'Chef' : 'Cuoco'}
                   </button>
                   <span className="text-ink/40">·</span>
-                  <span className="font-mono font-semibold text-ink/70">PIN: {u.pin}</span>
+                  <span className="font-semibold text-ink/70">PIN impostato</span>
                   <button
                     onClick={() => {
                       setEditingPinId(editingPinId === u.id ? null : u.id);
-                      setNewPinValue(u.pin);
+                      setNewPinValue('');
                     }}
                     className="text-ink/50 underline"
                   >
