@@ -9,8 +9,8 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('push', (event) => {
   let data = {
-    title: 'Nuovo ordine KitchenOS',
-    body: 'Un operatore ha inviato una lista ordini.',
+    title: 'Nuova richiesta KitchenOS',
+    body: 'Un cuoco ha inviato una nuova richiesta.',
     url: '/',
   };
 
