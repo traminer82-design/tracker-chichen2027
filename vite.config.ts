@@ -12,7 +12,7 @@ export default defineConfig(() => {
           id: '/',
           name: 'KitchenOS',
           short_name: 'KitchenOS',
-          description: 'Gestione inventario cucina in tempo reale.',
+          description: 'Richieste merce e ordini di cucina in tempo reale.',
           theme_color: '#ffffff',
           background_color: '#ffffff',
           display: 'standalone',

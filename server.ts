@@ -3,6 +3,10 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import path from 'path';
 import notifyOrderHandler from './api/notify-order.js';
+import notifyStatusHandler from './api/notify-status.js';
+import loginHandler from './api/login.js';
+import setupHandler from './api/setup.js';
+import adminUsersHandler from './api/admin-users.js';
 
 dotenv.config();
 
@@ -47,6 +51,18 @@ app.post('/api/send-alert', async (req, res) => {
 
 app.post('/api/notify-order', async (req, res) => {
   await notifyOrderHandler(req, res);
+});
+app.post('/api/notify-status', async (req, res) => {
+  await notifyStatusHandler(req, res);
+});
+app.post('/api/login', async (req, res) => {
+  await loginHandler(req, res);
+});
+app.post('/api/setup', async (req, res) => {
+  await setupHandler(req, res);
+});
+app.post('/api/admin-users', async (req, res) => {
+  await adminUsersHandler(req, res);
 });
 
 async function start() {
