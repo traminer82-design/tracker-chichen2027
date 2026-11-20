@@ -19,20 +19,14 @@ export default defineConfig(() => {
           start_url: '/',
           scope: '/',
           icons: [
-            {
-              src: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
-              sizes: '512x512',
-              type: 'image/png',
-              purpose: 'any',
-            },
-            {
-              src: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
-              sizes: '512x512',
-              type: 'image/png',
-              purpose: 'maskable',
-            }
+            { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+            { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+            { src: '/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
           ],
         },
+        includeAssets: ['favicon.ico', 'favicon-32.png', 'icon-192.png', 'icon-512.png', 'badge-96.png', 'apple-touch-icon.png'],
+        // Un solo service worker: quello dell'app include anche la gestione delle notifiche push.
+        workbox: { importScripts: ['firebase-messaging-sw.js'] },
         devOptions: {
             enabled: true,
             type: 'module',

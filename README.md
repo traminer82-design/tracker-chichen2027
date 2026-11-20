@@ -10,7 +10,7 @@ Richieste merce e ordini di cucina in tempo reale: **3 cuochi** inviano le richi
 
 ## Giacenza
 
-- Sezioni per tipo di prodotto: **Carne, Pesce, Fondi, Pasta fresca, Altro** (i vecchi prodotti con altre categorie vanno in *Altro*).
+- Colonne per tipo di prodotto: **Carne, Pesce, Pasticceria, Altro** (quattro colonne affiancate su PC/tablet; su telefono si scorre di lato). I vecchi prodotti con altre categorie (fondi, pasta fresca, verdure…) vanno in *Altro*.
 - Tutti gli operatori registrano **consumi (−) e carichi (+)**: tasti ±1 oppure tocco sul numero per una quantità libera. Ogni articolo mostra chi ha fatto l'ultima modifica.
 - Le **soglie minime** le imposta solo lo Chef (Impostazioni → Soglie minime); i cuochi non le vedono, non vedono "sotto scorta" e non possono eliminare prodotti.
 
