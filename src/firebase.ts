@@ -24,8 +24,17 @@ export async function registerPushToken(): Promise<string | null> {
   const supported = await isSupported().catch(() => false);
   if (!supported) return null;
 
-  const reg = await navigator.serviceWorker.register('/firebase-messaging-sw.js');
-  await navigator.serviceWorker.ready;
+  // Due service worker nello stesso ambito si sostituiscono a vicenda e le notifiche ad app chiusa
+  // smettono di arrivare: si usa quello dell'app (che include la gestione push).
+  const reg = await Promise.race([
+    navigator.serviceWorker.ready,
+    new Promise<ServiceWorkerRegistration>((resolve) =>
+      setTimeout(
+        () => resolve(navigator.serviceWorker.register('/firebase-messaging-sw.js')),
+        8000,
+      ),
+    ),
+  ]);
 
   const messaging = getMessaging(app);
   return await getToken(messaging, {
