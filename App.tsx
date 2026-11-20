@@ -5,6 +5,7 @@ import {
   deleteDoc,
   deleteField,
   doc,
+  getDoc,
   increment,
   limit,
   onSnapshot,
@@ -17,6 +18,8 @@ import {
 } from 'firebase/firestore';
 import {
   Archive,
+  Bell,
+  Settings,
   Check,
   CheckCheck,
   ChefHat,
@@ -48,7 +51,7 @@ import { auth, db } from './firebase';
 type Role = 'cuoco' | 'chef';
 type OrderStatus = 'inviata' | 'ordinata' | 'archiviata';
 type TS = { seconds: number };
-type Category = 'carne' | 'pesce' | 'verdure' | 'latticini' | 'pasticceria' | 'altro';
+type Category = 'carne' | 'pesce' | 'fondi' | 'pasta_fresca' | 'altro';
 type StorageZone = 'cella_congelamento' | 'magazzino';
 type OrderUnit = 'kg' | 'l' | 'cartoni' | 'pezzi' | 'conf';
 
@@ -69,6 +72,9 @@ type Item = {
   category: Category;
   zone: StorageZone;
   productId?: string;
+  updatedAt?: TS | null;
+  updatedBy?: string;
+  lastDelta?: number;
 };
 type Draft = {
   id?: string;
@@ -113,11 +119,18 @@ const UNIT_LABEL: Record<OrderUnit, string> = { kg: 'kg', l: 'lt', cartoni: 'crt
 const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
   { id: 'carne', label: 'Carne', emoji: '🥩' },
   { id: 'pesce', label: 'Pesce', emoji: '🐟' },
-  { id: 'verdure', label: 'Verdure', emoji: '🥬' },
-  { id: 'latticini', label: 'Latticini', emoji: '🧀' },
-  { id: 'pasticceria', label: 'Pasticceria', emoji: '🥐' },
+  { id: 'fondi', label: 'Fondi', emoji: '🍲' },
+  { id: 'pasta_fresca', label: 'Pasta fresca', emoji: '🍝' },
   { id: 'altro', label: 'Altro', emoji: '📦' },
 ];
+
+// I vecchi prodotti con altre categorie (verdure, latticini, pasticceria…) finiscono in "Altro".
+function normalizeCategory(c?: string): Category {
+  const k = String(c ?? '').toLowerCase().trim().replace(/\s+/g, '_');
+  if (k === 'carne' || k === 'pesce' || k === 'fondi') return k;
+  if (k === 'pasta_fresca' || k === 'pasta') return 'pasta_fresca';
+  return 'altro';
+}
 
 const itemsCol = collection(db, 'items');
 const usersCol = collection(db, 'users');
@@ -125,6 +138,22 @@ const ordersCol = collection(db, 'orders');
 const productsCol = collection(db, 'products');
 
 const isLow = (i: Item) => i.quantity <= i.min;
+
+// Legge un articolo anche dai vecchi documenti (campo "threshold" al posto di "min", categorie diverse).
+function toItem(id: string, data: Record<string, any>): Item {
+  const min =
+    typeof data.min === 'number' ? data.min : typeof data.threshold === 'number' ? data.threshold : 1;
+  return {
+    ...data,
+    id,
+    name: data.name ?? '?',
+    quantity: typeof data.quantity === 'number' ? data.quantity : 0,
+    unit: data.unit ?? 'kg',
+    zone: data.zone ?? 'cella_congelamento',
+    category: normalizeCategory(data.category),
+    min,
+  } as Item;
+}
 
 // Accesso: il PIN è verificato dal server, che restituisce un token Firebase.
 async function authWithServer(url: string, body: object): Promise<string | null> {
@@ -195,7 +224,8 @@ function normalizeOrderUnit(u?: string): OrderUnit {
 }
 
 /* ─── Suono notifica (doppio squillo ad alto volume) ──── */
-function playNotifySound() {
+function playNotifySound(force = false) {
+  if (!force && localStorage.getItem('kitchenos-sound') === 'off') return;
   try {
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
     const ctx = new AudioCtx();
@@ -242,8 +272,8 @@ async function showPushNotification(title: string, body: string) {
 
   const options: NotificationOptions = {
     body,
-    icon: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
-    badge: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
+    icon: '/icon-192.png',
+    badge: '/badge-96.png',
     tag: 'kitchenos-order-' + Date.now(),
     requireInteraction: true,
   };
@@ -268,7 +298,7 @@ export default function App() {
   );
   const [booting, setBooting] = useState(true);
   const [usersError, setUsersError] = useState('');
-  const [tab, setTab] = useState<'giacenza' | 'ordini' | 'account'>('ordini');
+  const [tab, setTab] = useState<'giacenza' | 'ordini' | 'impostazioni'>('ordini');
   const [orders, setOrders] = useState<Order[]>([]);
   const [ordersError, setOrdersError] = useState('');
   const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
@@ -387,7 +417,6 @@ export default function App() {
             .slice(0, 6)
             .join(', ');
           setFlash(`Ordinato dallo chef: ${names}`);
-          showPushNotification('Merce ordinata', names);
         }
 
         if (!initialOrdersLoaded.current) {
@@ -412,10 +441,14 @@ export default function App() {
     return unsub;
   }, [currentUser?.id, currentUser?.role]);
 
-  // Registra il dispositivo per le notifiche push (con ruolo, così ogni avviso va alla persona giusta).
+  // Notifiche push ad app chiusa: SOLO lo Chef registra il proprio dispositivo.
   useEffect(() => {
     if (!currentUser) return;
     const u = currentUser;
+    if (u.role !== 'chef') {
+      deleteDoc(doc(db, 'pushTokens', u.id)).catch(() => {}); // pulizia di eventuali vecchi token
+      return;
+    }
     (async () => {
       try {
         if ('Notification' in window && Notification.permission === 'default') {
@@ -497,7 +530,7 @@ export default function App() {
           {isChef && (
             <button
               onClick={() => {
-                playNotifySound();
+                playNotifySound(true);
                 showPushNotification('Test Notifica KitchenOS', 'Audio e notifiche attivi.');
               }}
               title="Testa suono notifica"
@@ -542,7 +575,7 @@ export default function App() {
         />
       )}
       {tab === 'giacenza' && <InventorySection currentUser={currentUser} />}
-      {tab === 'account' && isChef && <AccountsSection users={users} />}
+      {tab === 'impostazioni' && isChef && <SettingsSection currentUser={currentUser} users={users} />}
 
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-ink/10 bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-xl justify-around py-2">
@@ -561,10 +594,10 @@ export default function App() {
           />
           {isChef && (
             <NavBtn
-              active={tab === 'account'}
-              onClick={() => setTab('account')}
-              icon={<Users className="size-5" />}
-              label="Account"
+              active={tab === 'impostazioni'}
+              onClick={() => setTab('impostazioni')}
+              icon={<Settings className="size-5" />}
+              label="Impostazioni"
             />
           )}
         </div>
@@ -815,29 +848,24 @@ function InventorySection({ currentUser }: { currentUser: User }) {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [onlyLow, setOnlyLow] = useState(false);
-  const [zoneFilter, setZoneFilter] = useState<'tutti' | StorageZone>('cella_congelamento');
-  const [filterCat, setFilterCat] = useState<Category | 'tutti'>('tutti');
+  const [zoneFilter, setZoneFilter] = useState<'tutti' | StorageZone>('tutti');
+  const [catTab, setCatTab] = useState<Category | 'tutti'>('tutti');
   const [draft, setDraft] = useState<Draft | null>(null);
+  const [adjusting, setAdjusting] = useState<Item | null>(null);
   const [toast, setToast] = useState('');
 
   useEffect(() => {
-    return onSnapshot(query(itemsCol, orderBy('name')), (snap) => {
-      setItems(
-        snap.docs.map(
-          (d) =>
-            ({
-              min: 1,
-              unit: 'kg',
-              quantity: 0,
-              category: 'altro',
-              zone: 'cella_congelamento',
-              ...(d.data() as object),
-              id: d.id,
-            }) as Item,
-        ),
-      );
-      setLoading(false);
-    });
+    return onSnapshot(
+      query(itemsCol, orderBy('name')),
+      (snap) => {
+        setItems(snap.docs.map((d) => toItem(d.id, d.data() as Record<string, any>)));
+        setLoading(false);
+      },
+      () => {
+        setLoading(false);
+        setToast('Impossibile caricare la giacenza. Controlla la connessione.');
+      },
+    );
   }, []);
 
   useEffect(() => {
@@ -846,10 +874,10 @@ function InventorySection({ currentUser }: { currentUser: User }) {
         snap.docs.map(
           (d) =>
             ({
-              category: 'altro',
               unit: 'kg',
               defaultMin: 1,
               ...(d.data() as object),
+              category: normalizeCategory((d.data() as { category?: string }).category),
               id: d.id,
             }) as Product,
         ),
@@ -870,13 +898,27 @@ function InventorySection({ currentUser }: { currentUser: User }) {
 
   const low = useMemo(() => zoneItems.filter(isLow), [zoneItems]);
 
+  // La soglia minima è un dato dello Chef: i cuochi non vedono né filtrano per "sotto scorta".
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return (onlyLow ? low : zoneItems).filter((i) => {
-      if (filterCat !== 'tutti' && i.category !== filterCat) return false;
-      return i.name.toLowerCase().includes(q);
+    return (onlyLow && isResp ? low : zoneItems).filter((i) => i.name.toLowerCase().includes(q));
+  }, [zoneItems, low, onlyLow, search, isResp]);
+
+  const catCounts = useMemo(() => {
+    const m: Record<string, number> = {};
+    zoneItems.forEach((i) => {
+      m[i.category] = (m[i.category] ?? 0) + 1;
     });
-  }, [zoneItems, low, onlyLow, search, filterCat]);
+    return m;
+  }, [zoneItems]);
+
+  const sections = useMemo(
+    () =>
+      CATEGORIES.filter((c) => catTab === 'tutti' || c.id === catTab)
+        .map((c) => ({ cat: c, rows: shown.filter((i) => i.category === c.id) }))
+        .filter((s) => catTab !== 'tutti' || s.rows.length > 0),
+    [shown, catTab],
+  );
 
   const catalogSuggestions = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -887,16 +929,22 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       .slice(0, 8);
   }, [products, items, search]);
 
-  async function change(i: Item, delta: number) {
+  // Carico/consumo: aggiorna la quantità senza bloccare l'interfaccia (funziona anche offline).
+  function change(i: Item, delta: number) {
     const next = Math.max(0, Number((i.quantity + delta).toFixed(2)));
-    if (next === i.quantity) return;
-    await updateDoc(doc(db, 'items', i.id), {
-      quantity: increment(Number((next - i.quantity).toFixed(2))),
+    const applied = Number((next - i.quantity).toFixed(2));
+    if (applied === 0) return;
+    updateDoc(doc(db, 'items', i.id), {
+      quantity: increment(applied),
+      lastDelta: applied,
+      updatedBy: currentUser.name,
       updatedAt: serverTimestamp(),
-    });
+    }).catch(() => setToast('Modifica non salvata. Controlla la connessione e riprova.'));
     if (!isLow(i) && next <= i.min) {
       sendEmailAlert(i, next);
-      setToast(`${i.name}: scorta bassa, avviso inviato`);
+      setToast(isResp ? `${i.name}: scorta bassa, avviso inviato` : `${i.name}: aggiornato`);
+    } else {
+      setToast(`${i.name}: ${applied > 0 ? '+' : '−'}${Math.abs(applied)} ${i.unit} → ${next}`);
     }
   }
 
@@ -936,20 +984,18 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       pid = ref.id;
     }
 
-    const safeMin = isResp
-      ? min
-      : itemId
-        ? items.find((x) => x.id === itemId)?.min ?? 1
-        : 1;
-
+    const before = itemId ? items.find((x) => x.id === itemId)?.quantity ?? quantity : 0;
     const data = {
       name: n,
       quantity,
       unit,
-      min: safeMin,
+      // Solo lo Chef scrive la soglia; per i cuochi il valore esistente non viene toccato.
+      ...(isResp ? { min } : itemId ? {} : { min: 1 }),
       category,
       zone,
       productId: pid,
+      lastDelta: Number((quantity - before).toFixed(2)),
+      updatedBy: currentUser.name,
       updatedAt: serverTimestamp(),
     };
     if (itemId) await updateDoc(doc(db, 'items', itemId), data);
@@ -958,41 +1004,54 @@ function InventorySection({ currentUser }: { currentUser: User }) {
 
   async function save() {
     if (!draft || !draft.name.trim()) return;
-    await saveToCatalogAndStock(
-      draft.name,
-      draft.category,
-      draft.unit,
-      draft.min,
-      draft.quantity,
-      draft.zone,
-      draft.id,
-      draft.productId,
-    );
-    setDraft(null);
-    setSearch('');
+    try {
+      await saveToCatalogAndStock(
+        draft.name,
+        draft.category,
+        draft.unit,
+        draft.min,
+        draft.quantity,
+        draft.zone,
+        draft.id,
+        draft.productId,
+      );
+      setDraft(null);
+      setSearch('');
+    } catch {
+      setToast('Salvataggio non riuscito. Controlla la connessione e riprova.');
+    }
   }
 
   async function addFromCatalog(p: Product) {
     const targetZone: StorageZone =
       zoneFilter === 'magazzino' ? 'magazzino' : 'cella_congelamento';
-    await addDoc(itemsCol, {
-      name: p.name,
-      quantity: 0,
-      unit: p.unit,
-      min: p.defaultMin,
-      category: p.category,
-      zone: targetZone,
-      productId: p.id,
-      updatedAt: serverTimestamp(),
-    });
-    setSearch('');
-    setToast(`"${p.name}" aggiunto in ${targetZone === 'cella_congelamento' ? 'Cella' : 'Magazzino'}`);
+    try {
+      await addDoc(itemsCol, {
+        name: p.name,
+        quantity: 0,
+        unit: p.unit,
+        min: isResp ? p.defaultMin : 1,
+        category: p.category,
+        zone: targetZone,
+        productId: p.id,
+        updatedBy: currentUser.name,
+        updatedAt: serverTimestamp(),
+      });
+      setSearch('');
+      setToast(`"${p.name}" aggiunto in ${targetZone === 'cella_congelamento' ? 'Cella' : 'Magazzino'}`);
+    } catch {
+      setToast('Non aggiunto. Controlla la connessione e riprova.');
+    }
   }
 
   async function remove() {
-    if (!draft?.id) return;
-    await deleteDoc(doc(db, 'items', draft.id));
-    setDraft(null);
+    if (!draft?.id || !isResp) return;
+    try {
+      await deleteDoc(doc(db, 'items', draft.id));
+      setDraft(null);
+    } catch {
+      setToast('Eliminazione non riuscita.');
+    }
   }
 
   async function shareList() {
@@ -1012,14 +1071,75 @@ function InventorySection({ currentUser }: { currentUser: User }) {
 
   const exact = items.some((i) => i.name.toLowerCase() === search.trim().toLowerCase());
   const exactInCatalog = products.some((p) => p.name.toLowerCase() === search.trim().toLowerCase());
+  const newDraft = (name: string): Draft => ({
+    name,
+    quantity: 1,
+    unit: 'kg',
+    min: 1,
+    category: catTab === 'tutti' ? 'altro' : catTab,
+    zone: zoneFilter === 'magazzino' ? 'magazzino' : 'cella_congelamento',
+  });
+
+  function renderRow(i: Item) {
+    const lowNow = isResp && isLow(i);
+    const last =
+      i.updatedBy && typeof i.lastDelta === 'number' && i.lastDelta !== 0
+        ? `${i.updatedBy} ${i.lastDelta > 0 ? '+' : '−'}${Math.abs(i.lastDelta)}${
+            i.updatedAt ? ` · ${fmtTs(i.updatedAt)}` : ''
+          }`
+        : '';
+    return (
+      <li
+        key={i.id}
+        className={`flex items-center gap-2 rounded-2xl bg-white p-2.5 pl-3 shadow-sm ring-1 ${
+          lowNow || i.quantity === 0 ? 'ring-tomato/50' : 'ring-ink/10'
+        }`}
+      >
+        <button className="min-w-0 flex-1 text-left" onClick={() => setDraft({ ...i })}>
+          <div className="truncate text-base font-semibold">{i.name}</div>
+          <div className={`text-xs ${lowNow || i.quantity === 0 ? 'font-semibold text-tomato' : 'text-ink/50'}`}>
+            {i.quantity === 0
+              ? `Finito · ${i.unit}`
+              : isResp
+                ? lowNow
+                  ? `Sotto scorta (min ${i.min} ${i.unit})`
+                  : `${i.unit} · min ${i.min}`
+                : i.unit}
+          </div>
+          {last && <div className="truncate text-[11px] text-ink/40">{last}</div>}
+        </button>
+        <button
+          aria-label={`Togli uno a ${i.name}`}
+          onClick={() => change(i, -1)}
+          className="grid size-12 place-items-center rounded-xl bg-paper active:bg-ink/10"
+        >
+          <Minus className="size-5" />
+        </button>
+        <button
+          aria-label={`Carico o consumo di ${i.name}`}
+          onClick={() => setAdjusting(i)}
+          className="w-14 rounded-lg py-1 text-center font-display text-2xl font-extrabold tabular-nums underline decoration-dotted decoration-ink/30 underline-offset-4"
+        >
+          {i.quantity}
+        </button>
+        <button
+          aria-label={`Aggiungi uno a ${i.name}`}
+          onClick={() => change(i, 1)}
+          className="grid size-12 place-items-center rounded-xl bg-basil text-white active:bg-basil/80"
+        >
+          <Plus className="size-5" />
+        </button>
+      </li>
+    );
+  }
 
   return (
     <div className="px-4">
       <div className="mb-3 grid grid-cols-3 gap-2 rounded-2xl bg-white p-1.5 shadow-sm ring-1 ring-ink/10">
         {[
+          { id: 'tutti' as const, label: 'Tutto' },
           { id: 'cella_congelamento' as const, label: '❄️ Cella Congel.' },
           { id: 'magazzino' as const, label: '📦 Magazzino' },
-          { id: 'tutti' as const, label: 'Tutto' },
         ].map((z) => (
           <button
             key={z.id}
@@ -1034,9 +1154,11 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       </div>
 
       <p className="mb-3 text-sm text-ink/60">
-        {low.length === 0
-          ? 'Tutto in scorta.'
-          : `${low.length} ${low.length === 1 ? 'prodotto sotto scorta' : 'prodotti sotto scorta'}.`}
+        {isResp
+          ? low.length === 0
+            ? 'Tutto in scorta.'
+            : `${low.length} ${low.length === 1 ? 'prodotto sotto scorta' : 'prodotti sotto scorta'}.`
+          : 'Tocca il numero per registrare un consumo o un carico.'}
       </p>
 
       <div className="sticky top-0 z-10 -mx-4 space-y-3 bg-paper/95 px-4 pb-3 pt-1 backdrop-blur">
@@ -1045,7 +1167,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Cerca o aggiungi prodotto in cella"
+            placeholder="Cerca o aggiungi prodotto"
             className="h-full flex-1 bg-transparent text-base outline-none"
           />
           {search && (
@@ -1057,55 +1179,57 @@ function InventorySection({ currentUser }: { currentUser: User }) {
 
         <div className="flex gap-2 overflow-x-auto pb-1">
           <button
-            onClick={() => setFilterCat('tutti')}
-            className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
-              filterCat === 'tutti' ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+            onClick={() => setCatTab('tutti')}
+            className={`shrink-0 rounded-full px-3 py-2 text-sm font-semibold ${
+              catTab === 'tutti' ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
             }`}
           >
-            Tutti
+            Tutte ({zoneItems.length})
           </button>
           {CATEGORIES.map((c) => (
             <button
               key={c.id}
-              onClick={() => setFilterCat(c.id)}
-              className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
-                filterCat === c.id ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+              onClick={() => setCatTab(c.id)}
+              className={`shrink-0 rounded-full px-3 py-2 text-sm font-semibold ${
+                catTab === c.id ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
               }`}
             >
-              {c.emoji} {c.label}
+              {c.emoji} {c.label} ({catCounts[c.id] ?? 0})
             </button>
           ))}
         </div>
 
-        <div className="flex gap-2">
-          {[
-            { label: `Tutti (${zoneItems.length})`, value: false },
-            { label: `Sotto scorta (${low.length})`, value: true },
-          ].map((t) => (
-            <button
-              key={t.label}
-              onClick={() => setOnlyLow(t.value)}
-              className={`h-10 rounded-full px-4 text-sm font-semibold transition-colors ${
-                onlyLow === t.value ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
-          {onlyLow && low.length > 0 && (
-            <button
-              onClick={shareList}
-              className="ml-auto flex h-10 items-center gap-1.5 rounded-full bg-basil px-3 text-sm font-semibold text-white"
-            >
-              <Share2 className="size-3.5" /> Condividi
-            </button>
-          )}
-        </div>
+        {isResp && (
+          <div className="flex gap-2">
+            {[
+              { label: `Tutti (${zoneItems.length})`, value: false },
+              { label: `Sotto scorta (${low.length})`, value: true },
+            ].map((t) => (
+              <button
+                key={t.label}
+                onClick={() => setOnlyLow(t.value)}
+                className={`h-10 rounded-full px-4 text-sm font-semibold transition-colors ${
+                  onlyLow === t.value ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+            {onlyLow && low.length > 0 && (
+              <button
+                onClick={shareList}
+                className="ml-auto flex h-10 items-center gap-1.5 rounded-full bg-basil px-3 text-sm font-semibold text-white"
+              >
+                <Share2 className="size-3.5" /> Condividi
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {loading ? (
         <p className="py-16 text-center text-ink/50">Caricamento…</p>
-      ) : shown.length === 0 ? (
+      ) : shown.length === 0 && catTab === 'tutti' ? (
         <div className="py-16 text-center text-ink/60">
           <Snowflake className="mx-auto mb-3 size-10 text-basil/60" />
           {zoneItems.length === 0
@@ -1115,50 +1239,30 @@ function InventorySection({ currentUser }: { currentUser: User }) {
               : 'Nessun risultato.'}
         </div>
       ) : (
-        <ul className="mt-2 space-y-2.5">
-          {shown.map((i) => {
-            const cat = CATEGORIES.find((c) => c.id === i.category);
-            return (
-              <li
-                key={i.id}
-                className={`flex items-center gap-2 rounded-2xl bg-white p-2.5 pl-3 shadow-sm ring-1 ${
-                  isLow(i) ? 'ring-tomato/50' : 'ring-ink/10'
-                }`}
-              >
-                <button className="min-w-0 flex-1 text-left" onClick={() => setDraft({ ...i })}>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-sm">{cat?.emoji}</span>
-                    <span className="truncate text-base font-semibold">{i.name}</span>
-                  </div>
-                  <div className={`text-xs ${isLow(i) ? 'font-semibold text-tomato' : 'text-ink/50'}`}>
-                    {i.quantity === 0
-                      ? `Finito · ${i.unit}`
-                      : isLow(i)
-                        ? `Sotto scorta (min ${i.min} ${i.unit})`
-                        : `${i.unit} · min ${i.min}`}
-                  </div>
-                </button>
-                <button
-                  aria-label={`Togli uno a ${i.name}`}
-                  onClick={() => change(i, -1)}
-                  className="grid size-12 place-items-center rounded-xl bg-paper active:bg-ink/10"
-                >
-                  <Minus className="size-5" />
-                </button>
-                <span className="w-12 text-center font-display text-2xl font-extrabold tabular-nums">
-                  {i.quantity}
+        <div className="mt-2 space-y-5">
+          {sections.map(({ cat, rows }) => (
+            <section key={cat.id}>
+              <h3 className="mb-2 flex items-center gap-2 font-display text-lg font-extrabold">
+                <span>{cat.emoji}</span> {cat.label}
+                <span className="rounded-full bg-ink/10 px-2 py-0.5 text-xs font-bold text-ink/60">
+                  {rows.length}
                 </span>
-                <button
-                  aria-label={`Aggiungi uno a ${i.name}`}
-                  onClick={() => change(i, 1)}
-                  className="grid size-12 place-items-center rounded-xl bg-basil text-white active:bg-basil/80"
-                >
-                  <Plus className="size-5" />
-                </button>
-              </li>
-            );
-          })}
-        </ul>
+                {isResp && rows.some(isLow) && (
+                  <span className="rounded-full bg-tomato/15 px-2 py-0.5 text-xs font-bold text-tomato">
+                    {rows.filter(isLow).length} sotto scorta
+                  </span>
+                )}
+              </h3>
+              {rows.length === 0 ? (
+                <p className="rounded-xl bg-white p-4 text-sm text-ink/60 ring-1 ring-ink/10">
+                  Nessun prodotto in {cat.label}.
+                </p>
+              ) : (
+                <ul className="space-y-2.5">{rows.map(renderRow)}</ul>
+              )}
+            </section>
+          ))}
+        </div>
       )}
 
       {search.trim() && catalogSuggestions.length > 0 && (
@@ -1186,16 +1290,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
 
       {search.trim() && !exact && !exactInCatalog && (
         <button
-          onClick={() =>
-            setDraft({
-              name: search.trim(),
-              quantity: 1,
-              unit: 'kg',
-              min: 1,
-              category: 'altro',
-              zone: zoneFilter === 'magazzino' ? 'magazzino' : 'cella_congelamento',
-            })
-          }
+          onClick={() => setDraft(newDraft(search.trim()))}
           className="mt-3 flex h-12 w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-basil font-semibold text-basil"
         >
           <Plus className="size-5" /> Nuovo prodotto &quot;{search.trim()}&quot;
@@ -1203,16 +1298,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       )}
 
       <button
-        onClick={() =>
-          setDraft({
-            name: '',
-            quantity: 1,
-            unit: 'kg',
-            min: 1,
-            category: 'altro',
-            zone: zoneFilter === 'magazzino' ? 'magazzino' : 'cella_congelamento',
-          })
-        }
+        onClick={() => setDraft(newDraft(''))}
         className="fixed bottom-20 left-1/2 z-20 flex h-14 -translate-x-1/2 items-center gap-2 rounded-full bg-ink px-7 text-base font-semibold text-white shadow-lg active:scale-95"
       >
         <Plus className="size-5" /> Aggiungi
@@ -1221,10 +1307,21 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       {toast && (
         <div
           role="status"
-          className="fixed inset-x-4 bottom-36 mx-auto max-w-sm rounded-xl bg-ink px-4 py-3 text-center text-white shadow-lg"
+          className="fixed inset-x-4 bottom-36 z-30 mx-auto max-w-sm rounded-xl bg-ink px-4 py-3 text-center text-white shadow-lg"
         >
           {toast}
         </div>
+      )}
+
+      {adjusting && (
+        <AdjustSheet
+          item={adjusting}
+          onApply={(delta) => {
+            change(adjusting, delta);
+            setAdjusting(null);
+          }}
+          onClose={() => setAdjusting(null)}
+        />
       )}
 
       {draft && (
@@ -1232,11 +1329,88 @@ function InventorySection({ currentUser }: { currentUser: User }) {
           draft={draft}
           setDraft={setDraft}
           canEditMin={isResp}
+          canDelete={isResp}
           onSave={save}
           onDelete={remove}
           onClose={() => setDraft(null)}
         />
       )}
+    </div>
+  );
+}
+
+// Registrazione rapida di un consumo (−) o di un carico (+) con quantità libera.
+function AdjustSheet({
+  item,
+  onApply,
+  onClose,
+}: {
+  item: Item;
+  onApply: (delta: number) => void;
+  onClose: () => void;
+}) {
+  const [amount, setAmount] = useState('1');
+  const val = parseFloat(amount.replace(',', '.'));
+  const ok = Number.isFinite(val) && val > 0;
+  return (
+    <div className="fixed inset-0 z-40 flex items-end bg-ink/40" onClick={onClose}>
+      <div
+        className="mx-auto w-full max-w-xl space-y-4 rounded-t-3xl bg-white p-5 pb-10"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between">
+          <div>
+            <h2 className="font-display text-2xl font-extrabold">{item.name}</h2>
+            <p className="text-sm text-ink/60">
+              In giacenza: <strong>{item.quantity} {item.unit}</strong>
+            </p>
+          </div>
+          <button aria-label="Chiudi" onClick={onClose}>
+            <X className="size-6" />
+          </button>
+        </div>
+        <div className="flex items-center gap-2 rounded-xl bg-paper px-4">
+          <input
+            inputMode="decimal"
+            autoFocus
+            aria-label="Quantità"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value.replace(/[^0-9.,]/g, ''))}
+            className="h-14 flex-1 bg-transparent font-display text-3xl font-extrabold outline-none"
+          />
+          <span className="font-semibold text-ink/60">{item.unit}</span>
+        </div>
+        <div className="flex gap-2">
+          {['0.5', '1', '2', '5', '10'].map((c) => (
+            <button
+              key={c}
+              onClick={() => setAmount(c)}
+              className={`h-11 flex-1 rounded-xl text-sm font-bold ${amount === c ? 'bg-ink text-white' : 'bg-paper'}`}
+            >
+              {c}
+            </button>
+          ))}
+        </div>
+        {ok && val > item.quantity && (
+          <p className="text-sm text-ink/60">Il consumo supera la giacenza: scenderà a 0.</p>
+        )}
+        <div className="grid grid-cols-2 gap-3">
+          <button
+            disabled={!ok}
+            onClick={() => onApply(-val)}
+            className="flex h-16 items-center justify-center gap-2 rounded-2xl bg-tomato text-lg font-bold text-white disabled:opacity-40"
+          >
+            <Minus className="size-5" /> Consumo
+          </button>
+          <button
+            disabled={!ok}
+            onClick={() => onApply(val)}
+            className="flex h-16 items-center justify-center gap-2 rounded-2xl bg-basil text-lg font-bold text-white disabled:opacity-40"
+          >
+            <Plus className="size-5" /> Carico
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1278,6 +1452,7 @@ function ItemSheet({
   draft,
   setDraft,
   canEditMin,
+  canDelete,
   onSave,
   onDelete,
   onClose,
@@ -1285,6 +1460,7 @@ function ItemSheet({
   draft: Draft;
   setDraft: (d: Draft) => void;
   canEditMin: boolean;
+  canDelete: boolean;
   onSave: () => void;
   onDelete: () => void;
   onClose: () => void;
@@ -1382,16 +1558,7 @@ function ItemSheet({
               Sotto o uguale a questa soglia il prodotto viene segnalato da riordinare.
             </p>
           </div>
-        ) : (
-          <div className="flex items-center justify-between rounded-2xl bg-paper px-4 py-3 text-sm text-ink/60">
-            <span className="flex items-center gap-1.5 font-medium">
-              <Lock className="size-4" /> Soglia sotto scorta
-            </span>
-            <span className="font-bold text-ink">
-              {draft.min} {draft.unit} (solo Chef)
-            </span>
-          </div>
-        )}
+        ) : null}
 
         <button
           onClick={onSave}
@@ -1401,7 +1568,7 @@ function ItemSheet({
           Salva
         </button>
 
-        {draft.id && (
+        {draft.id && canDelete && (
           <button
             onClick={() => (confirmDel ? onDelete() : setConfirmDel(true))}
             className="flex h-11 w-full items-center justify-center gap-2 font-semibold text-tomato"
@@ -1927,10 +2094,10 @@ function OrdersSection({
         snap.docs.map(
           (d) =>
             ({
-              category: 'altro',
               unit: 'kg',
               defaultMin: 1,
               ...(d.data() as object),
+              category: normalizeCategory((d.data() as { category?: string }).category),
               id: d.id,
             }) as Product,
         ),
@@ -2087,20 +2254,6 @@ function OrdersSection({
     );
   }
 
-  // Avvisa via push i cuochi le cui richieste sono state ordinate (best-effort).
-  function notifyCooks(list: Order[]) {
-    if (!online) return;
-    const userIds = Array.from(new Set(list.map((o) => o.operatorId))).filter(
-      (id) => id && id !== currentUser.id,
-    );
-    if (userIds.length === 0) return;
-    authedPost('/api/notify-status', {
-        userIds: userIds.slice(0, 10),
-        chefName: currentUser.name,
-        products: list.flatMap((o) => o.lines.map((l) => l.name)).slice(0, 20),
-      });
-  }
-
   function deleteOrder(o: Order) {
     deleteDoc(doc(db, 'orders', o.id)).catch(failToast);
     toast('Richiesta eliminata');
@@ -2124,7 +2277,6 @@ function OrdersSection({
     if (!isChef) return;
     const prev = o.status;
     updateDoc(doc(db, 'orders', o.id), statusPatch(prev, to, currentUser)).catch(failToast);
-    if (to === 'ordinata' && prev === 'inviata') notifyCooks([o]);
     const text =
       to === 'archiviata'
         ? 'Archiviata'
@@ -2223,7 +2375,6 @@ function OrdersSection({
       batch.update(doc(db, 'orders', id), statusPatch('inviata', 'ordinata', currentUser)),
     );
     batch.commit().catch(failToast);
-    notifyCooks(visible.slice(0, 400));
     setSnack({
       text: `${ids.length} richieste segnate come Ordinate`,
       undo: () => {
@@ -2758,7 +2909,7 @@ function OrdersSection({
 }
 
 /* ─── Sezione Account con PIN (solo Chef) ──────── */
-function AccountsSection({ users }: { users: User[] }) {
+function AccountsSection({ users, embedded = false }: { users: User[]; embedded?: boolean }) {
   const [name, setName] = useState('');
   const [pin, setPin] = useState('');
   const [role, setRole] = useState<Role>('cuoco');
@@ -2815,7 +2966,7 @@ function AccountsSection({ users }: { users: User[] }) {
   }
 
   return (
-    <div className="px-4">
+    <div className={embedded ? '' : 'px-4'}>
       <h2 className="mb-1 font-display text-xl font-extrabold">Gestione Cuochi & PIN</h2>
       <p className="mb-4 text-sm text-ink/60">
         Crea i cuochi (e lo Chef) assegnando nome e PIN a 4 cifre per accedere e inviare le richieste.
@@ -2934,6 +3085,365 @@ function AccountsSection({ users }: { users: User[] }) {
           {toast}
         </div>
       )}
+    </div>
+  );
+}
+
+
+/* ─── Impostazioni (solo Chef) ───────────────────────────── */
+function SettingsCard({
+  icon,
+  title,
+  hint,
+  open,
+  onToggle,
+  children,
+}: {
+  icon: ReactNode;
+  title: string;
+  hint: string;
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <section className="rounded-2xl bg-white shadow-sm ring-1 ring-ink/10">
+      <button
+        onClick={onToggle}
+        className="flex min-h-16 w-full items-center gap-3 px-4 py-3 text-left"
+        aria-expanded={open}
+      >
+        <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-basil/15 text-basil">{icon}</span>
+        <span className="min-w-0 flex-1">
+          <span className="block font-display text-lg font-extrabold">{title}</span>
+          <span className="block text-xs text-ink/50">{hint}</span>
+        </span>
+        <span className="text-sm font-semibold text-ink/50">{open ? 'Chiudi' : 'Apri'}</span>
+      </button>
+      {open && <div className="border-t border-ink/5 p-4">{children}</div>}
+    </section>
+  );
+}
+
+function SettingsSection({ currentUser, users }: { currentUser: User; users: User[] }) {
+  const [open, setOpen] = useState<'notifiche' | 'soglie' | 'account' | null>('notifiche');
+  const toggle = (k: 'notifiche' | 'soglie' | 'account') => setOpen(open === k ? null : k);
+  return (
+    <div className="space-y-3 px-4">
+      <h2 className="font-display text-2xl font-extrabold">Impostazioni</h2>
+      <SettingsCard
+        icon={<Bell className="size-5" />}
+        title="Notifiche ad app chiusa"
+        hint="Arrivano solo a te (Chef) su questo dispositivo"
+        open={open === 'notifiche'}
+        onToggle={() => toggle('notifiche')}
+      >
+        <NotifySettings me={currentUser} />
+      </SettingsCard>
+      <SettingsCard
+        icon={<Lock className="size-5" />}
+        title="Soglie minime di giacenza"
+        hint="Solo tu le vedi e le modifichi"
+        open={open === 'soglie'}
+        onToggle={() => toggle('soglie')}
+      >
+        <ThresholdSettings />
+      </SettingsCard>
+      <SettingsCard
+        icon={<Users className="size-5" />}
+        title="Cuochi e PIN"
+        hint="Crea, modifica ed elimina gli account"
+        open={open === 'account'}
+        onToggle={() => toggle('account')}
+      >
+        <AccountsSection users={users} embedded />
+      </SettingsCard>
+    </div>
+  );
+}
+
+function CheckRow({ ok, label, hint }: { ok: boolean | null; label: string; hint?: string }) {
+  return (
+    <li className="flex items-start gap-2 py-2">
+      <span
+        className={`mt-0.5 grid size-5 shrink-0 place-items-center rounded-full text-white ${
+          ok === null ? 'bg-ink/30' : ok ? 'bg-basil' : 'bg-tomato'
+        }`}
+      >
+        {ok ? <Check className="size-3.5" /> : ok === null ? null : <X className="size-3.5" />}
+      </span>
+      <span className="text-sm">
+        <span className="font-semibold">{label}</span>
+        {hint && <span className="block text-xs text-ink/50">{hint}</span>}
+      </span>
+    </li>
+  );
+}
+
+function NotifySettings({ me }: { me: User }) {
+  const supported =
+    typeof window !== 'undefined' &&
+    'Notification' in window &&
+    'serviceWorker' in navigator &&
+    'PushManager' in window;
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const standalone =
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (navigator as unknown as { standalone?: boolean }).standalone === true;
+  const hasVapid = Boolean(import.meta.env.VITE_FIREBASE_VAPID_KEY);
+
+  const [perm, setPerm] = useState<string>('Notification' in window ? Notification.permission : 'unsupported');
+  const [reg, setReg] = useState<{ tail: string; at?: TS | null } | null | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [sound, setSound] = useState(localStorage.getItem('kitchenos-sound') !== 'off');
+
+  async function refresh() {
+    try {
+      const snap = await getDoc(doc(db, 'pushTokens', me.id));
+      const d = snap.exists() ? (snap.data() as { token?: string; updatedAt?: TS }) : null;
+      setReg(d?.token ? { tail: String(d.token).slice(-6), at: d.updatedAt ?? null } : null);
+    } catch {
+      setReg(null);
+    }
+  }
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function enable() {
+    setBusy(true);
+    setMsg(null);
+    try {
+      if (!supported) {
+        throw new Error(
+          isIOS && !standalone
+            ? 'Su iPhone aggiungi prima l’app alla Home (Condividi → Aggiungi a Home) e riaprila da lì.'
+            : 'Questo browser non supporta le notifiche.',
+        );
+      }
+      const p = await Notification.requestPermission();
+      setPerm(p);
+      if (p !== 'granted') {
+        throw new Error('Permesso negato: attiva le notifiche di KitchenOS dalle impostazioni del telefono o del browser.');
+      }
+      if (!hasVapid) throw new Error('Manca la chiave VAPID: aggiungi VITE_FIREBASE_VAPID_KEY su Vercel e rifai il deploy.');
+      const { registerPushToken } = await import('./firebase');
+      const token = await registerPushToken();
+      if (!token) throw new Error('Registrazione non riuscita. Riprova tra qualche secondo.');
+      await setDoc(doc(db, 'pushTokens', me.id), {
+        token,
+        userId: me.id,
+        userName: me.name,
+        role: me.role,
+        updatedAt: serverTimestamp(),
+      });
+      await refresh();
+      setMsg({ ok: true, text: 'Fatto: questo dispositivo riceverà le notifiche ad app chiusa.' });
+    } catch (e) {
+      setMsg({ ok: false, text: e instanceof Error ? e.message : 'Operazione non riuscita.' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disable() {
+    setBusy(true);
+    try {
+      await deleteDoc(doc(db, 'pushTokens', me.id));
+      await refresh();
+      setMsg({ ok: true, text: 'Notifiche disattivate su questo account.' });
+    } catch {
+      setMsg({ ok: false, text: 'Non riuscito. Controlla la connessione.' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // delay > 0: il server aspetta qualche secondo, così puoi chiudere l'app prima che parta la notifica.
+  async function sendTest(delaySec: number) {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const tok = await auth.currentUser?.getIdToken();
+      const r = await fetch('/api/test-push', {
+        method: 'POST',
+        keepalive: true,
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+        body: JSON.stringify({ delay: delaySec * 1000 }),
+      });
+      if (!r.ok) throw new Error((await r.text().catch(() => '')) || 'Invio non riuscito.');
+      setMsg({
+        ok: true,
+        text: delaySec
+          ? `Test avviato: chiudi subito l’app. Entro ${delaySec + 3} secondi dovrebbe comparire la notifica.`
+          : 'Notifica inviata: dovrebbe comparire entro pochi secondi.',
+      });
+    } catch (e) {
+      setMsg({ ok: false, text: e instanceof Error ? e.message : 'Invio non riuscito.' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function toggleSound() {
+    const next = !sound;
+    setSound(next);
+    localStorage.setItem('kitchenos-sound', next ? 'on' : 'off');
+  }
+
+  const btn = 'flex h-12 w-full items-center justify-center gap-2 rounded-xl text-sm font-bold disabled:opacity-40';
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-ink/70">
+        Quando un cuoco invia una richiesta, solo il telefono dello Chef riceve la notifica, anche con l’app chiusa.
+        Il token vale per <strong>un solo dispositivo</strong>: l’ultimo su cui attivi le notifiche.
+      </p>
+
+      <ul className="divide-y divide-ink/5 rounded-xl bg-paper px-3">
+        <CheckRow ok={supported} label="Il dispositivo supporta le notifiche" hint={supported ? undefined : 'Su iPhone serve iOS 16.4+ e l’app aggiunta alla Home.'} />
+        {isIOS && <CheckRow ok={standalone} label="App aperta dalla schermata Home" hint="Su iPhone le notifiche funzionano solo così." />}
+        <CheckRow ok={perm === 'granted' ? true : perm === 'denied' ? false : null} label={`Permesso notifiche: ${perm === 'granted' ? 'consentito' : perm === 'denied' ? 'negato' : 'da richiedere'}`} />
+        <CheckRow ok={hasVapid} label="Chiave VAPID configurata" hint={hasVapid ? undefined : 'Variabile VITE_FIREBASE_VAPID_KEY su Vercel.'} />
+        <CheckRow
+          ok={reg === undefined ? null : Boolean(reg)}
+          label={reg ? `Dispositivo registrato (…${reg.tail})${reg.at ? ` · ${fmtTs(reg.at)}` : ''}` : 'Dispositivo registrato'}
+          hint={reg === null ? 'Tocca "Attiva notifiche su questo dispositivo".' : undefined}
+        />
+      </ul>
+
+      {msg && (
+        <p role="status" className={`rounded-xl px-3 py-2.5 text-sm font-semibold ${msg.ok ? 'bg-basil/15 text-basil' : 'bg-tomato/15 text-tomato'}`}>
+          {msg.text}
+        </p>
+      )}
+
+      <div className="space-y-2">
+        <button onClick={enable} disabled={busy} className={`${btn} bg-basil text-white`}>
+          <Bell className="size-4" /> Attiva notifiche su questo dispositivo
+        </button>
+        <button onClick={() => sendTest(0)} disabled={busy || !reg} className={`${btn} bg-paper`}>
+          Invia notifica di prova
+        </button>
+        <button onClick={() => sendTest(8)} disabled={busy || !reg} className={`${btn} bg-paper`}>
+          Prova con app chiusa (parte dopo 8 secondi)
+        </button>
+        {reg && (
+          <button onClick={disable} disabled={busy} className={`${btn} text-tomato ring-1 ring-tomato/30`}>
+            Disattiva su questo account
+          </button>
+        )}
+      </div>
+
+      <div className="flex items-center justify-between rounded-xl bg-paper px-3 py-2.5">
+        <div>
+          <div className="text-sm font-semibold">Suono con l’app aperta</div>
+          <div className="text-xs text-ink/50">Avviso sonoro per nuove richieste e ordini.</div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => playNotifySound(true)} className="h-10 rounded-lg bg-white px-3 text-xs font-bold ring-1 ring-ink/10">
+            Prova
+          </button>
+          <button
+            onClick={toggleSound}
+            role="switch"
+            aria-checked={sound}
+            className={`h-10 w-16 rounded-full text-xs font-bold ${sound ? 'bg-basil text-white' : 'bg-ink/15 text-ink/60'}`}
+          >
+            {sound ? 'Attivo' : 'Spento'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ThresholdSettings() {
+  const [items, setItems] = useState<Item[]>([]);
+  const [q, setQ] = useState('');
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    return onSnapshot(
+      query(itemsCol, orderBy('name')),
+      (snap) => setItems(snap.docs.map((d) => toItem(d.id, d.data() as Record<string, any>))),
+      () => setErr('Impossibile caricare i prodotti.'),
+    );
+  }, []);
+
+  function setMin(i: Item, value: number) {
+    const next = Math.max(0, Number(value.toFixed(2)));
+    if (next === i.min) return;
+    setErr('');
+    updateDoc(doc(db, 'items', i.id), { min: next, updatedAt: serverTimestamp() }).catch(() =>
+      setErr('Soglia non salvata. Controlla la connessione.'),
+    );
+    if (i.productId) updateDoc(doc(db, 'products', i.productId), { defaultMin: next }).catch(() => {});
+  }
+
+  const needle = q.trim().toLowerCase();
+  const lowCount = items.filter(isLow).length;
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-ink/70">
+        Sotto o uguale alla soglia il prodotto risulta da riordinare e parte l’avviso email. I cuochi non vedono questo valore.
+      </p>
+      <p className="text-sm font-semibold">
+        {lowCount === 0 ? 'Nessun prodotto sotto scorta.' : `${lowCount} sotto scorta adesso.`}
+      </p>
+      <label className="flex h-11 items-center gap-2 rounded-xl bg-paper px-3">
+        <Search className="size-4 text-ink/50" />
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Cerca prodotto"
+          className="h-full flex-1 bg-transparent text-sm outline-none"
+        />
+      </label>
+      {err && <p className="rounded-xl bg-tomato/15 px-3 py-2 text-sm font-semibold text-tomato">{err}</p>}
+
+      {CATEGORIES.map((c) => {
+        const rows = items.filter((i) => i.category === c.id && (!needle || i.name.toLowerCase().includes(needle)));
+        if (rows.length === 0) return null;
+        return (
+          <div key={c.id}>
+            <h3 className="mb-1 font-display text-base font-extrabold">
+              {c.emoji} {c.label} <span className="text-xs font-bold text-ink/40">({rows.length})</span>
+            </h3>
+            <ul className="divide-y divide-ink/5 rounded-xl bg-paper px-3">
+              {rows.map((i) => {
+                const step = i.unit === 'kg' || i.unit === 'l' ? 0.5 : 1;
+                return (
+                  <li key={i.id} className="flex items-center gap-2 py-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-semibold">{i.name}</div>
+                      <div className={`text-xs ${isLow(i) ? 'font-semibold text-tomato' : 'text-ink/50'}`}>
+                        In giacenza: {i.quantity} {i.unit}
+                      </div>
+                    </div>
+                    <button
+                      aria-label={`Diminuisci soglia di ${i.name}`}
+                      onClick={() => setMin(i, i.min - step)}
+                      className="grid size-11 place-items-center rounded-xl bg-white ring-1 ring-ink/10"
+                    >
+                      <Minus className="size-4" />
+                    </button>
+                    <span className="w-12 text-center font-display text-xl font-extrabold tabular-nums">{i.min}</span>
+                    <button
+                      aria-label={`Aumenta soglia di ${i.name}`}
+                      onClick={() => setMin(i, i.min + step)}
+                      className="grid size-11 place-items-center rounded-xl bg-white ring-1 ring-ink/10"
+                    >
+                      <Plus className="size-4" />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        );
+      })}
     </div>
   );
 }

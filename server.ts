@@ -3,7 +3,7 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import path from 'path';
 import notifyOrderHandler from './api/notify-order.js';
-import notifyStatusHandler from './api/notify-status.js';
+import testPushHandler from './api/test-push.js';
 import loginHandler from './api/login.js';
 import setupHandler from './api/setup.js';
 import adminUsersHandler from './api/admin-users.js';
@@ -52,8 +52,8 @@ app.post('/api/send-alert', async (req, res) => {
 app.post('/api/notify-order', async (req, res) => {
   await notifyOrderHandler(req, res);
 });
-app.post('/api/notify-status', async (req, res) => {
-  await notifyStatusHandler(req, res);
+app.post('/api/test-push', async (req, res) => {
+  await testPushHandler(req, res);
 });
 app.post('/api/login', async (req, res) => {
   await loginHandler(req, res);

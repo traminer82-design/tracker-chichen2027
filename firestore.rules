@@ -68,26 +68,20 @@ service cloud.firestore {
     }
 
     // ── Inventario (giacenza): la soglia minima la decide solo lo Chef ──
+    // I vecchi articoli (campo "threshold", senza "min") restano modificabili: se "min" manca vale 1.
     match /items/{itemId} {
-      allow read, delete: if signedIn();
-      allow create: if signedIn()
+      allow read: if signedIn();
+      allow delete: if isChef();
+      allow create, update: if signedIn()
         && request.resource.data.name is string
         && request.resource.data.name.size() > 0
         && request.resource.data.name.size() <= 60
         && request.resource.data.quantity is number
         && request.resource.data.quantity >= 0
-        && request.resource.data.min is number
-        && request.resource.data.min >= 0
-        && (isChef() || request.resource.data.min == 1);
-      allow update: if signedIn()
-        && request.resource.data.name is string
-        && request.resource.data.name.size() > 0
-        && request.resource.data.name.size() <= 60
-        && request.resource.data.quantity is number
-        && request.resource.data.quantity >= 0
-        && request.resource.data.min is number
-        && request.resource.data.min >= 0
-        && (isChef() || request.resource.data.min == resource.data.get('min', 1));
+        && request.resource.data.get('min', 1) is number
+        && request.resource.data.get('min', 1) >= 0
+        && (isChef()
+          || request.resource.data.get('min', 1) == (resource == null ? 1 : resource.data.get('min', 1)));
     }
 
     // ── Catalogo derrate: tutti aggiungono, solo lo Chef elimina o cambia le soglie ──
