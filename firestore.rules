@@ -1,39 +1,126 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Inventario (giacenza)
+
+    // ── Identità e ruoli ─────────────────────────────────────────────
+    // L'accesso avviene tramite /api/login (PIN verificato dal server): l'uid Firebase
+    // coincide con l'id del documento in "users", che è la fonte unica del ruolo.
+    function signedIn() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    function me() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function isChef() {
+      return signedIn() && me().role in ['chef', 'responsabile'];
+    }
+
+    // ── Ordini / richieste ───────────────────────────────────────────
+    // inviata -> ordinata -> archiviata (si può tornare indietro di un passo).
+    // I vecchi valori pending/received/done restano accettati come stato di partenza.
+    function statusIdx(s) {
+      return (s == 'inviata' || s == 'pending') ? 0
+           : (s == 'ordinata' || s == 'received') ? 1
+           : (s == 'archiviata' || s == 'done') ? 2
+           : -1;
+    }
+    function validLines(l) {
+      return l is list && l.size() > 0 && l.size() <= 50;
+    }
+
+    match /orders/{orderId} {
+      allow read: if signedIn();
+
+      // Ogni utente crea richieste solo a proprio nome, sempre in stato "inviata".
+      allow create: if signedIn()
+        && request.resource.data.operatorId == request.auth.uid
+        && request.resource.data.operatorName == me().name
+        && request.resource.data.status == 'inviata'
+        && validLines(request.resource.data.lines)
+        && (!('note' in request.resource.data) || request.resource.data.note.size() <= 200)
+        && !('orderedAt' in request.resource.data)
+        && !('archivedAt' in request.resource.data);
+
+      allow update: if signedIn()
+        && request.resource.data.operatorId == resource.data.operatorId
+        && request.resource.data.operatorName == resource.data.operatorName
+        && request.resource.data.createdAt == resource.data.createdAt
+        && validLines(request.resource.data.lines)
+        && statusIdx(request.resource.data.status) >= 0
+        && (
+          // Lo Chef supervisiona tutto: modifica e sposta di un passo avanti/indietro.
+          (isChef()
+            && statusIdx(request.resource.data.status) - statusIdx(resource.data.status) <= 1
+            && statusIdx(resource.data.status) - statusIdx(request.resource.data.status) <= 1)
+          // Il cuoco può correggere solo la PROPRIA richiesta ancora "Da ordinare", senza cambiarne lo stato.
+          || (resource.data.operatorId == request.auth.uid
+            && statusIdx(resource.data.status) == 0
+            && statusIdx(request.resource.data.status) == 0
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['lines', 'note', 'supplier', 'tags', 'updatedAt', 'editedByName']))
+        );
+
+      // Lo Chef può eliminare qualsiasi richiesta; il cuoco solo la propria ancora "Da ordinare".
+      allow delete: if signedIn()
+        && (isChef()
+          || (resource.data.operatorId == request.auth.uid && statusIdx(resource.data.status) == 0));
+    }
+
+    // ── Inventario (giacenza): la soglia minima la decide solo lo Chef ──
     match /items/{itemId} {
-      allow read, delete: if true;
-      allow create, update: if request.resource.data.name is string
+      allow read, delete: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.name is string
         && request.resource.data.name.size() > 0
         && request.resource.data.name.size() <= 60
         && request.resource.data.quantity is number
         && request.resource.data.quantity >= 0
         && request.resource.data.min is number
-        && request.resource.data.min >= 0;
-    }
-
-    // Storico / catalogo derrate (condiviso)
-    match /products/{productId} {
-      allow read, delete: if true;
-      allow create, update: if request.resource.data.name is string
+        && request.resource.data.min >= 0
+        && (isChef() || request.resource.data.min == 1);
+      allow update: if signedIn()
+        && request.resource.data.name is string
         && request.resource.data.name.size() > 0
-        && request.resource.data.name.size() <= 60;
+        && request.resource.data.name.size() <= 60
+        && request.resource.data.quantity is number
+        && request.resource.data.quantity >= 0
+        && request.resource.data.min is number
+        && request.resource.data.min >= 0
+        && (isChef() || request.resource.data.min == resource.data.get('min', 1));
     }
 
-    // Account (nome + ruolo + PIN)
+    // ── Catalogo derrate: tutti aggiungono, solo lo Chef elimina o cambia le soglie ──
+    match /products/{productId} {
+      allow read: if signedIn();
+      allow delete: if isChef();
+      allow create: if signedIn()
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 60
+        && (isChef() || request.resource.data.get('defaultMin', 1) == 1);
+      allow update: if signedIn()
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 60
+        && (isChef() || request.resource.data.get('defaultMin', 1) == resource.data.get('defaultMin', 1));
+    }
+
+    // ── Account: elenco pubblico (nomi e ruoli, serve alla schermata di accesso) ──
+    // Scrittura SOLO dal server (/api/admin-users, /api/setup): nessun cuoco può cambiarsi il ruolo.
     match /users/{userId} {
-      allow read, write: if true;
+      allow read: if true;
+      allow write: if false;
     }
 
-    // Ordini dagli operatori al responsabile
-    match /orders/{orderId} {
-      allow read, write: if true;
+    // PIN (hash) e tentativi di accesso: mai accessibili dal browser.
+    match /credentials/{userId} {
+      allow read, write: if false;
     }
 
-    // Token push FCM per notifiche ad app chiusa
+    // Token push: ognuno gestisce solo il proprio dispositivo.
     match /pushTokens/{userId} {
-      allow read, write: if true;
+      allow read, write: if signedIn() && request.auth.uid == userId;
     }
   }
 }
