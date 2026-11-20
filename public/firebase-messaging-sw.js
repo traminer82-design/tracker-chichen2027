@@ -32,11 +32,11 @@ self.addEventListener('push', (event) => {
   event.waitUntil(
     self.registration.showNotification(data.title, {
       body: data.body,
-      icon: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
-      badge: 'https://cdn-icons-png.flaticon.com/512/3652/3652191.png',
+      icon: '/icon-192.png',
+      badge: '/badge-96.png',
       vibrate: [350, 120, 350, 120, 500],
       requireInteraction: true,
-      tag: 'kitchenos-order-' + Date.now(),
+      tag: 'kitchenos-' + Date.now(),
       data: { url: data.url },
     }),
   );
