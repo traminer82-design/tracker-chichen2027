@@ -939,7 +939,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       lastDelta: applied,
       updatedBy: currentUser.name,
       updatedAt: serverTimestamp(),
-    }).catch((e: any) => setToast(`Modifica non salvata (${e?.code ?? 'errore'}). Controlla la connessione e riprova.`));
+    }).catch(() => setToast('Modifica non salvata. Controlla la connessione e riprova.'));
     if (!isLow(i) && next <= i.min) {
       sendEmailAlert(i, next);
       setToast(isResp ? `${i.name}: scorta bassa, avviso inviato` : `${i.name}: aggiornato`);
@@ -1017,8 +1017,8 @@ function InventorySection({ currentUser }: { currentUser: User }) {
       );
       setDraft(null);
       setSearch('');
-    } catch (e: any) {
-      setToast(`Salvataggio non riuscito (${e?.code ?? 'errore'}). Controlla la connessione e riprova.`);
+    } catch {
+      setToast('Salvataggio non riuscito. Controlla la connessione e riprova.');
     }
   }
 
