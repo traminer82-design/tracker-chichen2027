@@ -22,6 +22,7 @@ import {
   Settings,
   Check,
   CheckCheck,
+  ChefHat,
   ClipboardList,
   KeyRound,
   Lock,
@@ -50,7 +51,7 @@ import { auth, db } from './firebase';
 type Role = 'cuoco' | 'chef';
 type OrderStatus = 'inviata' | 'ordinata' | 'archiviata';
 type TS = { seconds: number };
-type Category = 'carne' | 'pesce' | 'pasticceria' | 'altro';
+type Category = 'carne' | 'pesce' | 'fondi' | 'pasta_fresca' | 'altro';
 type StorageZone = 'cella_congelamento' | 'magazzino';
 type OrderUnit = 'kg' | 'l' | 'cartoni' | 'pezzi' | 'conf';
 
@@ -118,15 +119,16 @@ const UNIT_LABEL: Record<OrderUnit, string> = { kg: 'kg', l: 'lt', cartoni: 'crt
 const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
   { id: 'carne', label: 'Carne', emoji: '🥩' },
   { id: 'pesce', label: 'Pesce', emoji: '🐟' },
-  { id: 'pasticceria', label: 'Pasticceria', emoji: '🧁' },
+  { id: 'fondi', label: 'Fondi', emoji: '🍲' },
+  { id: 'pasta_fresca', label: 'Pasta fresca', emoji: '🍝' },
   { id: 'altro', label: 'Altro', emoji: '📦' },
 ];
 
-// I vecchi prodotti con altre categorie (verdure, latticini, fondi, pasta fresca…) finiscono in "Altro".
+// I vecchi prodotti con altre categorie (verdure, latticini, pasticceria…) finiscono in "Altro".
 function normalizeCategory(c?: string): Category {
   const k = String(c ?? '').toLowerCase().trim().replace(/\s+/g, '_');
-  if (k === 'carne' || k === 'pesce') return k;
-  if (k === 'pasticceria' || k === 'dolci' || k === 'dessert') return 'pasticceria';
+  if (k === 'carne' || k === 'pesce' || k === 'fondi') return k;
+  if (k === 'pasta_fresca' || k === 'pasta') return 'pasta_fresca';
   return 'altro';
 }
 
@@ -516,16 +518,13 @@ export default function App() {
   }
 
   return (
-    <div className={`mx-auto min-h-dvh pb-24 pt-4 ${tab === 'giacenza' ? 'max-w-6xl' : 'max-w-xl'}`}>
+    <div className="mx-auto min-h-dvh max-w-xl pb-24 pt-4">
       <header className="mb-3 flex items-center justify-between px-4">
-        <div className="flex items-center gap-3">
-          <img src="/icon-192.png" alt="" className="size-12 rounded-xl shadow-sm" />
-          <div>
-            <h1 className="font-display text-3xl font-extrabold leading-none tracking-tight">KitchenOS</h1>
-            <p className="mt-1 text-sm text-ink/60">
-              {currentUser.name} · {isChef ? 'Chef' : 'Cuoco'}
-            </p>
-          </div>
+        <div>
+          <h1 className="font-display text-3xl font-extrabold tracking-tight">KitchenOS</h1>
+          <p className="text-sm text-ink/60">
+            {currentUser.name} · {isChef ? 'Chef' : 'Cuoco'}
+          </p>
         </div>
         <div className="flex items-center gap-2">
           {isChef && (
@@ -703,7 +702,7 @@ function LoginScreen({
     return (
       <div className="mx-auto flex min-h-dvh max-w-sm flex-col justify-center gap-5 px-6">
         <div className="text-center">
-          <img src="/icon-192.png" alt="" className="mx-auto mb-3 size-16 rounded-2xl shadow-sm" />
+          <ChefHat className="mx-auto mb-3 size-14 text-basil" />
           <h1 className="font-display text-3xl font-extrabold">KitchenOS</h1>
           <p className="mt-2 text-ink/60">Configura l&apos;account Chef</p>
         </div>
@@ -806,7 +805,7 @@ function LoginScreen({
   return (
     <div className="mx-auto flex min-h-dvh max-w-sm flex-col justify-center gap-6 px-6">
       <div className="text-center">
-        <img src="/icon-192.png" alt="" className="mx-auto mb-3 size-16 rounded-2xl shadow-sm" />
+        <ChefHat className="mx-auto mb-3 size-14 text-basil" />
         <h1 className="font-display text-3xl font-extrabold">KitchenOS</h1>
         <p className="mt-2 text-ink/60">Seleziona il tuo account e inserisci il PIN</p>
       </div>
@@ -916,7 +915,8 @@ function InventorySection({ currentUser }: { currentUser: User }) {
   const sections = useMemo(
     () =>
       CATEGORIES.filter((c) => catTab === 'tutti' || c.id === catTab)
-        .map((c) => ({ cat: c, rows: shown.filter((i) => i.category === c.id) })),
+        .map((c) => ({ cat: c, rows: shown.filter((i) => i.category === c.id) }))
+        .filter((s) => catTab !== 'tutti' || s.rows.length > 0),
     [shown, catTab],
   );
 
@@ -942,6 +942,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
     }).catch(() => setToast('Modifica non salvata. Controlla la connessione e riprova.'));
     if (!isLow(i) && next <= i.min) {
       sendEmailAlert(i, next);
+      authedPost('/api/notify-low', { name: i.name, quantity: next, unit: i.unit });
       setToast(isResp ? `${i.name}: scorta bassa, avviso inviato` : `${i.name}: aggiornato`);
     } else {
       setToast(`${i.name}: ${applied > 0 ? '+' : '−'}${Math.abs(applied)} ${i.unit} → ${next}`);
@@ -1096,7 +1097,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
         }`}
       >
         <button className="min-w-0 flex-1 text-left" onClick={() => setDraft({ ...i })}>
-          <div className="truncate text-base font-semibold lg:whitespace-normal lg:line-clamp-2 lg:leading-tight">{i.name}</div>
+          <div className="truncate text-base font-semibold">{i.name}</div>
           <div className={`text-xs ${lowNow || i.quantity === 0 ? 'font-semibold text-tomato' : 'text-ink/50'}`}>
             {i.quantity === 0
               ? `Finito · ${i.unit}`
@@ -1111,21 +1112,21 @@ function InventorySection({ currentUser }: { currentUser: User }) {
         <button
           aria-label={`Togli uno a ${i.name}`}
           onClick={() => change(i, -1)}
-          className="grid size-12 place-items-center rounded-xl bg-paper active:bg-ink/10 lg:size-10"
+          className="grid size-12 place-items-center rounded-xl bg-paper active:bg-ink/10"
         >
           <Minus className="size-5" />
         </button>
         <button
           aria-label={`Carico o consumo di ${i.name}`}
           onClick={() => setAdjusting(i)}
-          className="w-14 rounded-lg py-1 text-center font-display text-2xl font-extrabold tabular-nums underline decoration-dotted decoration-ink/30 underline-offset-4 lg:w-10 lg:text-xl"
+          className="w-14 rounded-lg py-1 text-center font-display text-2xl font-extrabold tabular-nums underline decoration-dotted decoration-ink/30 underline-offset-4"
         >
           {i.quantity}
         </button>
         <button
           aria-label={`Aggiungi uno a ${i.name}`}
           onClick={() => change(i, 1)}
-          className="grid size-12 place-items-center rounded-xl bg-basil text-white active:bg-basil/80 lg:size-10"
+          className="grid size-12 place-items-center rounded-xl bg-basil text-white active:bg-basil/80"
         >
           <Plus className="size-5" />
         </button>
@@ -1239,18 +1240,9 @@ function InventorySection({ currentUser }: { currentUser: User }) {
               : 'Nessun risultato.'}
         </div>
       ) : (
-        <div
-          className={`mt-2 flex items-start gap-3 overflow-x-auto pb-2 ${
-            catTab === 'tutti' ? 'snap-x snap-mandatory md:grid md:grid-cols-2 md:overflow-visible lg:grid-cols-4' : ''
-          }`}
-        >
+        <div className="mt-2 space-y-5">
           {sections.map(({ cat, rows }) => (
-            <section
-              key={cat.id}
-              className={`rounded-2xl bg-white/60 p-2.5 ring-1 ring-ink/5 ${
-                catTab === 'tutti' ? 'min-w-[88%] snap-start md:min-w-0' : 'min-w-full'
-              }`}
-            >
+            <section key={cat.id}>
               <h3 className="mb-2 flex items-center gap-2 font-display text-lg font-extrabold">
                 <span>{cat.emoji}</span> {cat.label}
                 <span className="rounded-full bg-ink/10 px-2 py-0.5 text-xs font-bold text-ink/60">
