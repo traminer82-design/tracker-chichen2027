@@ -51,7 +51,7 @@ import { auth, db } from './firebase';
 type Role = 'cuoco' | 'chef';
 type OrderStatus = 'inviata' | 'ordinata' | 'archiviata';
 type TS = { seconds: number };
-type Category = 'carne' | 'pesce' | 'fondi' | 'pasta_fresca' | 'pasticceria' | 'zuppe' | 'verdure' | 'ripieni' | 'altro';
+type Category = 'carne' | 'pesce' | 'fondi' | 'pasta_fresca' | 'pasticceria' | 'zuppe' | 'verdure' | 'ripieni' | 'primi' | 'contorni' | 'gel' | 'buffet' | 'torte_colazione' | 'altro';
 type StorageZone = 'cella_congelamento' | 'magazzino';
 type OrderUnit = 'kg' | 'l' | 'cartoni' | 'pezzi' | 'conf';
 
@@ -125,6 +125,11 @@ const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
   { id: 'zuppe', label: 'Zuppe', emoji: '🥣' },
   { id: 'verdure', label: 'Verdure', emoji: '🥬' },
   { id: 'ripieni', label: 'Ripieni', emoji: '🥟' },
+  { id: 'primi', label: 'Primi piatti', emoji: '🍽️' },
+  { id: 'contorni', label: 'Contorni', emoji: '🥗' },
+  { id: 'gel', label: 'Gel', emoji: '🍮' },
+  { id: 'buffet', label: 'Buffet', emoji: '🥂' },
+  { id: 'torte_colazione', label: 'Torte colazione', emoji: '🍰' },
   { id: 'altro', label: 'Altro', emoji: '📦' },
 ];
 
@@ -136,6 +141,11 @@ function normalizeCategory(c?: string): Category {
   if (k === 'zuppa') return 'zuppe';
   if (k === 'verdura') return 'verdure';
   if (k === 'ripieno') return 'ripieni';
+  if (k === 'primi' || k === 'primi_piatti' || k === 'primo') return 'primi';
+  if (k === 'contorni' || k === 'contorno') return 'contorni';
+  if (k === 'gel' || k === 'buffet') return k;
+  if (k === 'buffett') return 'buffet';
+  if (k === 'torte_colazione' || k === 'torte') return 'torte_colazione';
   if (k === 'pasta_fresca' || k === 'pasta') return 'pasta_fresca';
   return 'altro';
 }
