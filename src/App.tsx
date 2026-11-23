@@ -51,7 +51,7 @@ import { auth, db } from './firebase';
 type Role = 'cuoco' | 'chef';
 type OrderStatus = 'inviata' | 'ordinata' | 'archiviata';
 type TS = { seconds: number };
-type Category = 'carne' | 'pesce' | 'fondi' | 'pasta_fresca' | 'altro';
+type Category = 'carne' | 'pesce' | 'fondi' | 'pasta_fresca' | 'pasticceria' | 'zuppe' | 'verdure' | 'ripieni' | 'altro';
 type StorageZone = 'cella_congelamento' | 'magazzino';
 type OrderUnit = 'kg' | 'l' | 'cartoni' | 'pezzi' | 'conf';
 
@@ -121,6 +121,10 @@ const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
   { id: 'pesce', label: 'Pesce', emoji: '🐟' },
   { id: 'fondi', label: 'Fondi', emoji: '🍲' },
   { id: 'pasta_fresca', label: 'Pasta fresca', emoji: '🍝' },
+  { id: 'pasticceria', label: 'Pasticceria', emoji: '🧁' },
+  { id: 'zuppe', label: 'Zuppe', emoji: '🥣' },
+  { id: 'verdure', label: 'Verdure', emoji: '🥬' },
+  { id: 'ripieni', label: 'Ripieni', emoji: '🥟' },
   { id: 'altro', label: 'Altro', emoji: '📦' },
 ];
 
@@ -128,6 +132,10 @@ const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
 function normalizeCategory(c?: string): Category {
   const k = String(c ?? '').toLowerCase().trim().replace(/\s+/g, '_');
   if (k === 'carne' || k === 'pesce' || k === 'fondi') return k;
+  if (k === 'pasticceria' || k === 'zuppe' || k === 'verdure' || k === 'ripieni') return k;
+  if (k === 'zuppa') return 'zuppe';
+  if (k === 'verdura') return 'verdure';
+  if (k === 'ripieno') return 'ripieni';
   if (k === 'pasta_fresca' || k === 'pasta') return 'pasta_fresca';
   return 'altro';
 }
@@ -1353,6 +1361,7 @@ function AdjustSheet({
   const [amount, setAmount] = useState('1');
   const val = parseFloat(amount.replace(',', '.'));
   const ok = Number.isFinite(val) && val > 0;
+  const okTotal = Number.isFinite(val) && val >= 0;
   return (
     <div className="fixed inset-0 z-40 flex items-end bg-ink/40" onClick={onClose}>
       <div
@@ -1411,6 +1420,13 @@ function AdjustSheet({
             <Plus className="size-5" /> Carico
           </button>
         </div>
+        <button
+          disabled={!okTotal}
+          onClick={() => onApply(Number((val - item.quantity).toFixed(2)))}
+          className="h-14 w-full rounded-2xl bg-ink text-base font-bold text-white disabled:opacity-40"
+        >
+          Imposta giacenza a {okTotal ? val : '…'} {item.unit}
+        </button>
       </div>
     </div>
   );
@@ -3127,8 +3143,8 @@ function SettingsCard({
 }
 
 function SettingsSection({ currentUser, users }: { currentUser: User; users: User[] }) {
-  const [open, setOpen] = useState<'notifiche' | 'soglie' | 'account' | null>('notifiche');
-  const toggle = (k: 'notifiche' | 'soglie' | 'account') => setOpen(open === k ? null : k);
+  const [open, setOpen] = useState<'notifiche' | 'soglie' | 'account' | 'condividi' | null>('notifiche');
+  const toggle = (k: 'notifiche' | 'soglie' | 'account' | 'condividi') => setOpen(open === k ? null : k);
   return (
     <div className="space-y-3 px-4">
       <h2 className="font-display text-2xl font-extrabold">Impostazioni</h2>
@@ -3159,6 +3175,76 @@ function SettingsSection({ currentUser, users }: { currentUser: User; users: Use
       >
         <AccountsSection users={users} embedded />
       </SettingsCard>
+      <SettingsCard
+        icon={<Share2 className="size-5" />}
+        title="Condividi l'app"
+        hint="Invia il link ai tuoi cuochi e installala sul loro telefono"
+        open={open === 'condividi'}
+        onToggle={() => toggle('condividi')}
+      >
+        <ShareAppSettings />
+      </SettingsCard>
+    </div>
+  );
+}
+
+function ShareAppSettings() {
+  const url = window.location.origin;
+  const text = `Ti invito su KitchenOS, l'app per ordini e giacenza della cucina: ${url}`;
+  const [msg, setMsg] = useState('');
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(url);
+      setMsg('Link copiato.');
+    } catch {
+      setMsg(`Copia a mano: ${url}`);
+    }
+  }
+  async function share() {
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: 'KitchenOS', text: 'Ti invito su KitchenOS', url });
+        return;
+      } catch {
+        return; // condivisione annullata
+      }
+    }
+    copy();
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl bg-paper p-3 text-sm break-all">{url}</div>
+      <div className="grid grid-cols-2 gap-2">
+        <button onClick={share} className="flex h-12 items-center justify-center gap-2 rounded-xl bg-basil font-semibold text-white">
+          <Share2 className="size-4" /> Condividi
+        </button>
+        <button onClick={copy} className="h-12 rounded-xl bg-paper font-semibold">
+          Copia link
+        </button>
+      </div>
+      <a
+        href={`https://wa.me/?text=${encodeURIComponent(text)}`}
+        target="_blank"
+        rel="noreferrer"
+        className="flex h-12 items-center justify-center rounded-xl bg-paper font-semibold"
+      >
+        Invia su WhatsApp
+      </a>
+      {msg && <p className="text-sm text-basil">{msg}</p>}
+      <div className="space-y-2 text-sm text-ink/70">
+        <p className="font-semibold text-ink">Per far entrare un nuovo cuoco</p>
+        <ol className="list-decimal space-y-1 pl-5">
+          <li>Crea il suo account in <strong>Cuochi e PIN</strong> (nome e PIN).</li>
+          <li>Invia il link qui sopra. Il PIN diglielo a parte, non nello stesso messaggio.</li>
+          <li>Sul suo telefono: apre il link e fa login con nome e PIN.</li>
+          <li>Android (Chrome): menu ⋮ → <em>Installa app</em>. iPhone (Safari): Condividi → <em>Aggiungi a Home</em>.</li>
+        </ol>
+        <p className="text-xs text-ink/50">
+          Tutti vedono gli stessi dati della tua cucina. Per un'altra cucina serve una copia separata dell'app.
+        </p>
+      </div>
     </div>
   );
 }
