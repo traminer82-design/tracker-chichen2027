@@ -14,6 +14,7 @@ import {
   serverTimestamp,
   setDoc,
   updateDoc,
+  where,
   writeBatch,
 } from 'firebase/firestore';
 import {
@@ -23,6 +24,9 @@ import {
   Check,
   CheckCheck,
   ChefHat,
+  ChevronLeft,
+  ChevronRight,
+  ListChecks,
   ClipboardList,
   KeyRound,
   Lock,
@@ -51,7 +55,7 @@ import { auth, db } from './firebase';
 type Role = 'cuoco' | 'chef';
 type OrderStatus = 'inviata' | 'ordinata' | 'archiviata';
 type TS = { seconds: number };
-type Category = 'carne' | 'pesce' | 'fondi' | 'pasta_fresca' | 'altro';
+type Category = 'carne' | 'pesce' | 'fondi' | 'pasta_fresca' | 'pasticceria' | 'zuppe' | 'verdure' | 'ripieni' | 'primi' | 'contorni' | 'gel' | 'buffet' | 'torte_colazione' | 'altro';
 type StorageZone = 'cella_congelamento' | 'magazzino';
 type OrderUnit = 'kg' | 'l' | 'cartoni' | 'pezzi' | 'conf';
 
@@ -121,6 +125,15 @@ const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
   { id: 'pesce', label: 'Pesce', emoji: '🐟' },
   { id: 'fondi', label: 'Fondi', emoji: '🍲' },
   { id: 'pasta_fresca', label: 'Pasta fresca', emoji: '🍝' },
+  { id: 'pasticceria', label: 'Pasticceria', emoji: '🧁' },
+  { id: 'zuppe', label: 'Zuppe', emoji: '🥣' },
+  { id: 'verdure', label: 'Verdure', emoji: '🥬' },
+  { id: 'ripieni', label: 'Ripieni', emoji: '🥟' },
+  { id: 'primi', label: 'Primi piatti', emoji: '🍽️' },
+  { id: 'contorni', label: 'Contorni', emoji: '🥗' },
+  { id: 'gel', label: 'Gel', emoji: '🍮' },
+  { id: 'buffet', label: 'Buffet', emoji: '🥂' },
+  { id: 'torte_colazione', label: 'Torte colazione', emoji: '🍰' },
   { id: 'altro', label: 'Altro', emoji: '📦' },
 ];
 
@@ -128,6 +141,15 @@ const CATEGORIES: { id: Category; label: string; emoji: string }[] = [
 function normalizeCategory(c?: string): Category {
   const k = String(c ?? '').toLowerCase().trim().replace(/\s+/g, '_');
   if (k === 'carne' || k === 'pesce' || k === 'fondi') return k;
+  if (k === 'pasticceria' || k === 'zuppe' || k === 'verdure' || k === 'ripieni') return k;
+  if (k === 'zuppa') return 'zuppe';
+  if (k === 'verdura') return 'verdure';
+  if (k === 'ripieno') return 'ripieni';
+  if (k === 'primi' || k === 'primi_piatti' || k === 'primo') return 'primi';
+  if (k === 'contorni' || k === 'contorno') return 'contorni';
+  if (k === 'gel' || k === 'buffet') return k;
+  if (k === 'buffett') return 'buffet';
+  if (k === 'torte_colazione' || k === 'torte') return 'torte_colazione';
   if (k === 'pasta_fresca' || k === 'pasta') return 'pasta_fresca';
   return 'altro';
 }
@@ -298,7 +320,7 @@ export default function App() {
   );
   const [booting, setBooting] = useState(true);
   const [usersError, setUsersError] = useState('');
-  const [tab, setTab] = useState<'giacenza' | 'ordini' | 'impostazioni'>('ordini');
+  const [tab, setTab] = useState<'giacenza' | 'ordini' | 'scaletta' | 'impostazioni'>('ordini');
   const [orders, setOrders] = useState<Order[]>([]);
   const [ordersError, setOrdersError] = useState('');
   const [online, setOnline] = useState(typeof navigator === 'undefined' ? true : navigator.onLine);
@@ -575,6 +597,7 @@ export default function App() {
         />
       )}
       {tab === 'giacenza' && <InventorySection currentUser={currentUser} />}
+      {tab === 'scaletta' && <TodoSection currentUser={currentUser} users={users} />}
       {tab === 'impostazioni' && isChef && <SettingsSection currentUser={currentUser} users={users} />}
 
       <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-ink/10 bg-white/95 backdrop-blur">
@@ -591,6 +614,12 @@ export default function App() {
             onClick={() => setTab('giacenza')}
             icon={<Package className="size-5" />}
             label="Giacenza"
+          />
+          <NavBtn
+            active={tab === 'scaletta'}
+            onClick={() => setTab('scaletta')}
+            icon={<ListChecks className="size-5" />}
+            label="Scaletta"
           />
           {isChef && (
             <NavBtn
@@ -942,6 +971,7 @@ function InventorySection({ currentUser }: { currentUser: User }) {
     }).catch(() => setToast('Modifica non salvata. Controlla la connessione e riprova.'));
     if (!isLow(i) && next <= i.min) {
       sendEmailAlert(i, next);
+      authedPost('/api/notify-low', { name: i.name, quantity: next, unit: i.unit });
       setToast(isResp ? `${i.name}: scorta bassa, avviso inviato` : `${i.name}: aggiornato`);
     } else {
       setToast(`${i.name}: ${applied > 0 ? '+' : '−'}${Math.abs(applied)} ${i.unit} → ${next}`);
@@ -1352,6 +1382,7 @@ function AdjustSheet({
   const [amount, setAmount] = useState('1');
   const val = parseFloat(amount.replace(',', '.'));
   const ok = Number.isFinite(val) && val > 0;
+  const okTotal = Number.isFinite(val) && val >= 0;
   return (
     <div className="fixed inset-0 z-40 flex items-end bg-ink/40" onClick={onClose}>
       <div
@@ -1410,6 +1441,13 @@ function AdjustSheet({
             <Plus className="size-5" /> Carico
           </button>
         </div>
+        <button
+          disabled={!okTotal}
+          onClick={() => onApply(Number((val - item.quantity).toFixed(2)))}
+          className="h-14 w-full rounded-2xl bg-ink text-base font-bold text-white disabled:opacity-40"
+        >
+          Imposta giacenza a {okTotal ? val : '…'} {item.unit}
+        </button>
       </div>
     </div>
   );
@@ -2908,6 +2946,236 @@ function OrdersSection({
   );
 }
 
+/* ─── Scaletta giornaliera per operatore ───────── */
+type Todo = { id: string; ownerId: string; ownerName: string; date: string; text: string; done: boolean; order: number };
+const todosCol = collection(db, 'todos');
+
+function dayStr(d: Date) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function shiftDay(s: string, n: number) {
+  const [y, m, d] = s.split('-').map(Number);
+  return dayStr(new Date(y, m - 1, d + n));
+}
+function dayLabel(s: string) {
+  const today = dayStr(new Date());
+  if (s === today) return 'Oggi';
+  if (s === shiftDay(today, 1)) return 'Domani';
+  if (s === shiftDay(today, -1)) return 'Ieri';
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' });
+}
+
+function TodoSection({ currentUser, users }: { currentUser: User; users: User[] }) {
+  const isChef = currentUser.role === 'chef';
+  const [ownerId, setOwnerId] = useState(currentUser.id);
+  const [day, setDay] = useState(dayStr(new Date()));
+  const [todos, setTodos] = useState<Todo[]>([]);
+  const [text, setText] = useState('');
+  const [toast, setToast] = useState('');
+  const owner = users.find((u) => u.id === ownerId) ?? currentUser;
+  const today = dayStr(new Date());
+
+  useEffect(() => {
+    setTodos([]);
+    return onSnapshot(
+      query(todosCol, where('ownerId', '==', ownerId)),
+      (snap) => setTodos(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Todo, 'id'>) }))),
+      (e) => setToast(`Impossibile caricare la scaletta (${(e as any)?.code ?? 'errore'}).`),
+    );
+  }, [ownerId]);
+
+  const dayTodos = useMemo(
+    () => todos.filter((t) => t.date === day).sort((a, b) => (a.order ?? 0) - (b.order ?? 0)),
+    [todos, day],
+  );
+  const open = dayTodos.filter((t) => !t.done);
+  const done = dayTodos.filter((t) => t.done);
+  const prevOpen = useMemo(() => todos.filter((t) => t.date === shiftDay(day, -1) && !t.done), [todos, day]);
+  const fail = (e: any) => setToast(`Non salvato (${e?.code ?? 'errore'}).`);
+
+  function add() {
+    const t = text.trim().slice(0, 200);
+    if (!t) return;
+    setText('');
+    setToast('');
+    addDoc(todosCol, {
+      ownerId: owner.id,
+      ownerName: owner.name,
+      date: day,
+      text: t,
+      done: false,
+      order: Date.now(),
+      createdBy: currentUser.id,
+    }).catch(fail);
+  }
+  function toggle(t: Todo) {
+    updateDoc(doc(db, 'todos', t.id), { done: !t.done }).catch(fail);
+  }
+  function remove(t: Todo) {
+    deleteDoc(doc(db, 'todos', t.id)).catch(fail);
+  }
+  function clearDone() {
+    const b = writeBatch(db);
+    done.forEach((t) => b.delete(doc(db, 'todos', t.id)));
+    b.commit().catch(fail);
+  }
+  function carryOver() {
+    const have = new Set(dayTodos.map((t) => t.text.toLowerCase()));
+    const b = writeBatch(db);
+    prevOpen
+      .filter((t) => !have.has(t.text.toLowerCase()))
+      .forEach((t, i) =>
+        b.set(doc(todosCol), {
+          ownerId: owner.id,
+          ownerName: owner.name,
+          date: day,
+          text: t.text,
+          done: false,
+          order: Date.now() + i,
+          createdBy: currentUser.id,
+        }),
+      );
+    b.commit().catch(fail);
+  }
+
+  const pct = dayTodos.length ? Math.round((done.length / dayTodos.length) * 100) : 0;
+
+  return (
+    <div className="space-y-3 px-4">
+      <h2 className="font-display text-2xl font-extrabold">Scaletta</h2>
+
+      {isChef && (
+        <div className="flex gap-2 overflow-x-auto pb-1">
+          {users.map((u) => (
+            <button
+              key={u.id}
+              onClick={() => setOwnerId(u.id)}
+              className={`shrink-0 rounded-full px-4 py-2 text-sm font-semibold ${
+                u.id === ownerId ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+              }`}
+            >
+              {u.id === currentUser.id ? 'Io' : u.name}
+            </button>
+          ))}
+        </div>
+      )}
+      {isChef && owner.id !== currentUser.id && (
+        <p className="text-sm font-semibold text-ink/70">Scaletta di {owner.name}</p>
+      )}
+
+      <div className="flex items-center justify-between rounded-2xl bg-white p-2 ring-1 ring-ink/10">
+        <button
+          onClick={() => setDay(shiftDay(day, -1))}
+          aria-label="Giorno precedente"
+          className="grid size-11 place-items-center rounded-xl bg-paper"
+        >
+          <ChevronLeft className="size-5" />
+        </button>
+        <button onClick={() => setDay(today)} className="text-center">
+          <div className="font-bold capitalize">{dayLabel(day)}</div>
+          {day !== today && <div className="text-xs text-ink/60">tocca per tornare a oggi</div>}
+        </button>
+        <button
+          onClick={() => setDay(shiftDay(day, 1))}
+          aria-label="Giorno successivo"
+          className="grid size-11 place-items-center rounded-xl bg-paper"
+        >
+          <ChevronRight className="size-5" />
+        </button>
+      </div>
+
+      {dayTodos.length > 0 && (
+        <div>
+          <div className="mb-1 flex justify-between text-xs font-semibold text-ink/60">
+            <span>
+              {done.length} di {dayTodos.length} fatte
+            </span>
+            <span>{pct}%</span>
+          </div>
+          <div className="h-2 overflow-hidden rounded-full bg-ink/10">
+            <div className="h-full rounded-full bg-basil transition-all" style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && add()}
+          maxLength={200}
+          placeholder="Aggiungi una cosa da fare…"
+          className="h-12 min-w-0 flex-1 rounded-xl bg-white px-4 ring-1 ring-ink/10 outline-none focus:ring-2 focus:ring-basil"
+        />
+        <button
+          onClick={add}
+          disabled={!text.trim()}
+          aria-label="Aggiungi"
+          className="grid size-12 shrink-0 place-items-center rounded-xl bg-basil text-white disabled:opacity-40"
+        >
+          <Plus className="size-5" />
+        </button>
+      </div>
+
+      {prevOpen.length > 0 && (
+        <button onClick={carryOver} className="w-full rounded-xl bg-paper py-2.5 text-sm font-semibold ring-1 ring-ink/10">
+          Riporta le {prevOpen.length} non fatte del giorno prima
+        </button>
+      )}
+
+      {toast && <p className="rounded-xl bg-tomato/15 px-3 py-2 text-sm font-semibold text-tomato">{toast}</p>}
+
+      <ul className="space-y-2">
+        {open.map((t) => (
+          <li key={t.id} className="flex items-center gap-3 rounded-2xl bg-white p-3 ring-1 ring-ink/10">
+            <button
+              onClick={() => toggle(t)}
+              aria-label="Segna come fatta"
+              className="size-9 shrink-0 rounded-full border-2 border-ink/25"
+            />
+            <span className="min-w-0 flex-1 break-words font-semibold">{t.text}</span>
+            <button onClick={() => remove(t)} aria-label="Elimina" className="p-2 text-ink/40">
+              <Trash2 className="size-4" />
+            </button>
+          </li>
+        ))}
+        {done.map((t) => (
+          <li key={t.id} className="flex items-center gap-3 rounded-2xl bg-paper p-3">
+            <button
+              onClick={() => toggle(t)}
+              aria-label="Riapri"
+              className="grid size-9 shrink-0 place-items-center rounded-full bg-basil text-white"
+            >
+              <Check className="size-5" />
+            </button>
+            <span className="min-w-0 flex-1 break-words text-ink/45 line-through">{t.text}</span>
+            <button
+              onClick={() => remove(t)}
+              aria-label="Togli dalla scaletta"
+              className="grid size-9 shrink-0 place-items-center rounded-full bg-white text-ink/60 ring-1 ring-ink/10"
+            >
+              <X className="size-4" />
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      {dayTodos.length === 0 && (
+        <p className="py-6 text-center text-sm text-ink/55">
+          Nessuna cosa da fare per questo giorno. Scrivila qui sopra.
+        </p>
+      )}
+
+      {done.length > 1 && (
+        <button onClick={clearDone} className="w-full rounded-xl py-2.5 text-sm font-semibold text-ink/60 ring-1 ring-ink/10">
+          Togli tutte le {done.length} fatte
+        </button>
+      )}
+    </div>
+  );
+}
+
 /* ─── Sezione Account con PIN (solo Chef) ──────── */
 function AccountsSection({ users, embedded = false }: { users: User[]; embedded?: boolean }) {
   const [name, setName] = useState('');
@@ -3126,8 +3394,8 @@ function SettingsCard({
 }
 
 function SettingsSection({ currentUser, users }: { currentUser: User; users: User[] }) {
-  const [open, setOpen] = useState<'notifiche' | 'soglie' | 'account' | null>('notifiche');
-  const toggle = (k: 'notifiche' | 'soglie' | 'account') => setOpen(open === k ? null : k);
+  const [open, setOpen] = useState<'notifiche' | 'soglie' | 'account' | 'condividi' | null>('notifiche');
+  const toggle = (k: 'notifiche' | 'soglie' | 'account' | 'condividi') => setOpen(open === k ? null : k);
   return (
     <div className="space-y-3 px-4">
       <h2 className="font-display text-2xl font-extrabold">Impostazioni</h2>
@@ -3158,6 +3426,76 @@ function SettingsSection({ currentUser, users }: { currentUser: User; users: Use
       >
         <AccountsSection users={users} embedded />
       </SettingsCard>
+      <SettingsCard
+        icon={<Share2 className="size-5" />}
+        title="Condividi l'app"
+        hint="Invia il link ai tuoi cuochi e installala sul loro telefono"
+        open={open === 'condividi'}
+        onToggle={() => toggle('condividi')}
+      >
+        <ShareAppSettings />
+      </SettingsCard>
+    </div>
+  );
+}
+
+function ShareAppSettings() {
+  const url = window.location.origin;
+  const text = `Ti invito su KitchenOS, l'app per ordini e giacenza della cucina: ${url}`;
+  const [msg, setMsg] = useState('');
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(url);
+      setMsg('Link copiato.');
+    } catch {
+      setMsg(`Copia a mano: ${url}`);
+    }
+  }
+  async function share() {
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: 'KitchenOS', text: 'Ti invito su KitchenOS', url });
+        return;
+      } catch {
+        return; // condivisione annullata
+      }
+    }
+    copy();
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl bg-paper p-3 text-sm break-all">{url}</div>
+      <div className="grid grid-cols-2 gap-2">
+        <button onClick={share} className="flex h-12 items-center justify-center gap-2 rounded-xl bg-basil font-semibold text-white">
+          <Share2 className="size-4" /> Condividi
+        </button>
+        <button onClick={copy} className="h-12 rounded-xl bg-paper font-semibold">
+          Copia link
+        </button>
+      </div>
+      <a
+        href={`https://wa.me/?text=${encodeURIComponent(text)}`}
+        target="_blank"
+        rel="noreferrer"
+        className="flex h-12 items-center justify-center rounded-xl bg-paper font-semibold"
+      >
+        Invia su WhatsApp
+      </a>
+      {msg && <p className="text-sm text-basil">{msg}</p>}
+      <div className="space-y-2 text-sm text-ink/70">
+        <p className="font-semibold text-ink">Per far entrare un nuovo cuoco</p>
+        <ol className="list-decimal space-y-1 pl-5">
+          <li>Crea il suo account in <strong>Cuochi e PIN</strong> (nome e PIN).</li>
+          <li>Invia il link qui sopra. Il PIN diglielo a parte, non nello stesso messaggio.</li>
+          <li>Sul suo telefono: apre il link e fa login con nome e PIN.</li>
+          <li>Android (Chrome): menu ⋮ → <em>Installa app</em>. iPhone (Safari): Condividi → <em>Aggiungi a Home</em>.</li>
+        </ol>
+        <p className="text-xs text-ink/50">
+          Tutti vedono gli stessi dati della tua cucina. Per un'altra cucina serve una copia separata dell'app.
+        </p>
+      </div>
     </div>
   );
 }
