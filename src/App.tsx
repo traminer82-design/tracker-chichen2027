@@ -1699,6 +1699,19 @@ function StatusTabBtn({
   );
 }
 
+// Le richieste arrivate dalle 17:00 in poi contano per il giorno dopo.
+const CUTOFF_HOUR = 17;
+function workDayOf(t?: TS | null): string {
+  const d = t ? new Date(t.seconds * 1000) : new Date();
+  if (d.getHours() >= CUTOFF_HOUR) d.setDate(d.getDate() + 1);
+  return dayStr(d);
+}
+function sentLabel(t?: TS | null): string {
+  const d = t ? new Date(t.seconds * 1000) : new Date();
+  const hm = d.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+  return dayStr(d) === dayStr(new Date()) ? hm : `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${hm}`;
+}
+
 function OrderCard({
   o,
   isChef,
@@ -2116,6 +2129,7 @@ function OrdersSection({
   const [orderSearch, setOrderSearch] = useState('');
   const [archiveShown, setArchiveShown] = useState(30);
   const [showSummary, setShowSummary] = useState(false);
+  const [unified, setUnified] = useState(true);
   const [snack, setSnack] = useState<{ text: string; undo?: () => void } | null>(null);
   const [view, setView] = useState<'richieste' | 'prodotti'>('richieste');
 
@@ -2389,11 +2403,33 @@ function OrdersSection({
     return sorted;
   }, [orders, statusTab, cookFilter, orderSearch, currentUser.id]);
 
-  // Riepilogo accorpato: stessi prodotti e unità sommati tra le richieste visibili.
+  // Richieste da ordinare oggi: quelle arrivate dopo le 17:00 sono già nel giorno dopo.
+  const today = dayStr(new Date());
+  const todayVisible = useMemo(
+    () => (statusTab === 'inviata' ? visible.filter((o) => workDayOf(o.createdAt) <= today) : visible),
+    [visible, statusTab, today],
+  );
+
+  // Lista unica: tutte le voci di tutte le richieste, nell'ordine di invio, divise per giorno.
+  const unifiedGroups = useMemo(() => {
+    if (statusTab !== 'inviata') return [];
+    const ts = (t?: TS | null) => (t ? t.seconds : Number.MAX_SAFE_INTEGER);
+    const rows = [...visible]
+      .sort((a, b) => ts(a.createdAt) - ts(b.createdAt))
+      .flatMap((o) => o.lines.map((l, i) => ({ key: `${o.id}-${i}`, o, l, day: workDayOf(o.createdAt) })));
+    const groups = new Map<string, typeof rows>();
+    rows.forEach((r) => {
+      const k = r.day <= today ? today : r.day;
+      groups.set(k, [...(groups.get(k) ?? []), r]);
+    });
+    return Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b));
+  }, [visible, statusTab, today]);
+
+  // Riepilogo accorpato: stessi prodotti e unità sommati tra le richieste di oggi.
   const summary = useMemo(() => {
     if (statusTab !== 'inviata') return [];
     const m = new Map<string, { name: string; unit: OrderUnit; qty: number; supplier: string; cooks: Set<string> }>();
-    visible.forEach((o) =>
+    todayVisible.forEach((o) =>
       o.lines.forEach((l) => {
         const k = `${o.supplier.trim().toLowerCase()}|${l.name.trim().toLowerCase()}|${l.unit}`;
         const cur = m.get(k) ?? { name: l.name, unit: l.unit, qty: 0, supplier: o.supplier, cooks: new Set<string>() };
@@ -2403,11 +2439,11 @@ function OrdersSection({
       }),
     );
     return Array.from(m.values()).sort((a, b) => a.supplier.localeCompare(b.supplier, 'it') || a.name.localeCompare(b.name, 'it'));
-  }, [visible, statusTab]);
+  }, [todayVisible, statusTab]);
 
   function bulkOrder() {
-    if (!isChef || visible.length === 0) return;
-    const ids = visible.slice(0, 400).map((o) => o.id);
+    if (!isChef || todayVisible.length === 0) return;
+    const ids = todayVisible.slice(0, 400).map((o) => o.id);
     const batch = writeBatch(db);
     ids.forEach((id) =>
       batch.update(doc(db, 'orders', id), statusPatch('inviata', 'ordinata', currentUser)),
@@ -2843,6 +2879,22 @@ function OrdersSection({
         </div>
 
         {isChef && statusTab === 'inviata' && visible.length > 0 && (
+          <div className="grid grid-cols-2 gap-2">
+            {([[true, 'Lista unica'], [false, 'Per richiesta']] as const).map(([v, label]) => (
+              <button
+                key={label}
+                onClick={() => setUnified(v)}
+                className={`h-11 rounded-xl text-sm font-bold ${
+                  unified === v ? 'bg-ink text-white' : 'bg-white ring-1 ring-ink/10'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {isChef && statusTab === 'inviata' && todayVisible.length > 0 && (
           <div className="space-y-2 rounded-2xl bg-white p-3 ring-1 ring-ink/10">
             <button
               onClick={() => setShowSummary((v) => !v)}
@@ -2878,7 +2930,7 @@ function OrdersSection({
               onClick={bulkOrder}
               className="flex h-14 w-full items-center justify-center gap-2 rounded-xl bg-basil text-base font-bold text-white"
             >
-              <CheckCheck className="size-5" /> Segna tutte Ordinate ({visible.length})
+              <CheckCheck className="size-5" /> Segna ordinate quelle di oggi ({todayVisible.length})
             </button>
           </div>
         )}
@@ -2889,6 +2941,45 @@ function OrdersSection({
             {orderSearch || cookFilter !== 'tutti'
               ? 'Nessun risultato con questi filtri.'
               : emptyText[statusTab]}
+          </div>
+        ) : isChef && statusTab === 'inviata' && unified ? (
+          <div className="space-y-4">
+            {unifiedGroups.map(([day, rows]) => (
+              <div key={day} className="rounded-2xl bg-white p-3 ring-1 ring-ink/10">
+                <h3 className="font-display text-base font-extrabold">
+                  {day === today
+                    ? 'Da ordinare oggi'
+                    : day === shiftDay(today, 1)
+                      ? 'Per domani (arrivate dopo le 17:00)'
+                      : `Per ${dayLabel(day)}`}
+                  <span className="ml-2 text-sm font-semibold text-ink/50">{rows.length} voci</span>
+                </h3>
+                <ul className="mt-1 divide-y divide-ink/5">
+                  {rows.map(({ key, o, l }) => (
+                    <li key={key} className="flex items-start gap-3 py-2.5">
+                      <div className="min-w-0 flex-1">
+                        <p className="break-words font-semibold">
+                          {l.name}
+                          {o.tags.includes('Urgente') && (
+                            <span className="ml-2 rounded-full bg-tomato/15 px-2 py-0.5 text-xs font-bold text-tomato">
+                              Urgente
+                            </span>
+                          )}
+                        </p>
+                        <p className="text-xs text-ink/55">
+                          {o.operatorName} · {sentLabel(o.createdAt)}
+                          {o.supplier ? ` · ${o.supplier}` : ''}
+                          {o.note ? ` · ${o.note}` : ''}
+                        </p>
+                      </div>
+                      <span className="shrink-0 font-bold tabular-nums">
+                        {Number(l.quantity.toFixed(2))} {UNIT_LABEL[l.unit]}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
           </div>
         ) : (
           <ul className="space-y-3">
@@ -2947,7 +3038,7 @@ function OrdersSection({
 }
 
 /* ─── Scaletta giornaliera per operatore ───────── */
-type Todo = { id: string; ownerId: string; ownerName: string; date: string; text: string; done: boolean; order: number };
+type Todo = { id: string; ownerId: string; ownerName: string; date: string; text: string; done: boolean; order: number; carriedFrom?: string };
 const todosCol = collection(db, 'todos');
 
 function dayStr(d: Date) {
@@ -2991,8 +3082,20 @@ function TodoSection({ currentUser, users }: { currentUser: User; users: User[] 
   );
   const open = dayTodos.filter((t) => !t.done);
   const done = dayTodos.filter((t) => t.done);
-  const prevOpen = useMemo(() => todos.filter((t) => t.date === shiftDay(day, -1) && !t.done), [todos, day]);
   const fail = (e: any) => setToast(`Non salvato (${e?.code ?? 'errore'}).`);
+
+  // Le cose non fatte nei giorni passati passano da sole alla scaletta di oggi.
+  const tried = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const late = todos.filter((t) => !t.done && t.date < today && !tried.current.has(t.id));
+    if (late.length === 0) return;
+    late.forEach((t) => tried.current.add(t.id));
+    const b = writeBatch(db);
+    late.forEach((t) =>
+      b.update(doc(db, 'todos', t.id), { date: today, carriedFrom: t.carriedFrom ?? t.date }),
+    );
+    b.commit().catch(fail);
+  }, [todos, today]);
 
   function add() {
     const t = text.trim().slice(0, 200);
@@ -3020,25 +3123,6 @@ function TodoSection({ currentUser, users }: { currentUser: User; users: User[] 
     done.forEach((t) => b.delete(doc(db, 'todos', t.id)));
     b.commit().catch(fail);
   }
-  function carryOver() {
-    const have = new Set(dayTodos.map((t) => t.text.toLowerCase()));
-    const b = writeBatch(db);
-    prevOpen
-      .filter((t) => !have.has(t.text.toLowerCase()))
-      .forEach((t, i) =>
-        b.set(doc(todosCol), {
-          ownerId: owner.id,
-          ownerName: owner.name,
-          date: day,
-          text: t.text,
-          done: false,
-          order: Date.now() + i,
-          createdBy: currentUser.id,
-        }),
-      );
-    b.commit().catch(fail);
-  }
-
   const pct = dayTodos.length ? Math.round((done.length / dayTodos.length) * 100) : 0;
 
   return (
@@ -3118,12 +3202,6 @@ function TodoSection({ currentUser, users }: { currentUser: User; users: User[] 
         </button>
       </div>
 
-      {prevOpen.length > 0 && (
-        <button onClick={carryOver} className="w-full rounded-xl bg-paper py-2.5 text-sm font-semibold ring-1 ring-ink/10">
-          Riporta le {prevOpen.length} non fatte del giorno prima
-        </button>
-      )}
-
       {toast && <p className="rounded-xl bg-tomato/15 px-3 py-2 text-sm font-semibold text-tomato">{toast}</p>}
 
       <ul className="space-y-2">
@@ -3134,7 +3212,14 @@ function TodoSection({ currentUser, users }: { currentUser: User; users: User[] 
               aria-label="Segna come fatta"
               className="size-9 shrink-0 rounded-full border-2 border-ink/25"
             />
-            <span className="min-w-0 flex-1 break-words font-semibold">{t.text}</span>
+            <span className="min-w-0 flex-1">
+              <span className="break-words font-semibold">{t.text}</span>
+              {t.carriedFrom && (
+                <span className="block text-xs font-semibold text-tomato">
+                  Riportata dal {t.carriedFrom.slice(8, 10)}/{t.carriedFrom.slice(5, 7)}
+                </span>
+              )}
+            </span>
             <button onClick={() => remove(t)} aria-label="Elimina" className="p-2 text-ink/40">
               <Trash2 className="size-4" />
             </button>
